@@ -23,6 +23,12 @@ type RmdirOptions = {
     };
 };
 
+// The Obsidian adapter does not expose these stats. isomorphic-git compares
+// them against the index to decide whether a file can be skipped, and missing
+// values become NaN, which never compares equal. That forces every status to
+// re-read and hash the whole working tree, so report stable placeholders.
+const STABLE_STATS = { uid: 0, gid: 0, ino: 0, dev: 0 };
+
 class FileNotFoundError extends Error {
     readonly code = "ENOENT";
 
@@ -191,6 +197,7 @@ export class MyAdapter {
                 this.indexmtime != undefined
             ) {
                 return {
+                    ...STABLE_STATS,
                     isFile: () => true,
                     isDirectory: () => false,
                     isSymbolicLink: () => false,
@@ -207,6 +214,7 @@ export class MyAdapter {
                 this.indexctime = stat.ctime;
                 this.indexmtime = stat.mtime;
                 return {
+                    ...STABLE_STATS,
                     ctimeMs: stat.ctime,
                     mtimeMs: stat.mtime,
                     size: stat.size,
@@ -223,6 +231,7 @@ export class MyAdapter {
         if (file instanceof TFile) {
             this.maybeLog("Reuse stat");
             return {
+                ...STABLE_STATS,
                 ctimeMs: file.stat.ctime,
                 mtimeMs: file.stat.mtime,
                 size: file.stat.size,
@@ -235,6 +244,7 @@ export class MyAdapter {
             const stat = await this.adapter.stat(path);
             if (stat) {
                 return {
+                    ...STABLE_STATS,
                     ctimeMs: stat.ctime,
                     mtimeMs: stat.mtime,
                     size: stat.size,

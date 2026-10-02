@@ -175,3 +175,26 @@ describe("IsomorphicGit working-tree mutations", () => {
         expect(plugin.displayError).not.toHaveBeenCalled();
     });
 });
+
+describe("IsomorphicGit.status", () => {
+    it("does not re-read unchanged files once the index stats are refreshed", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const { manager, plugin } = createIsomorphicGitManager(repo.repoPath);
+        const adapter = plugin.app.vault.adapter;
+        const readBinary = vi.spyOn(adapter, "readBinary");
+        const workTreeReads = () =>
+            readBinary.mock.calls.filter(
+                ([vaultPath]) =>
+                    !vaultPath.replace(/^\/+/, "").startsWith(".git")
+            ).length;
+
+        // The index was written by native git, so its stats differ from the
+        // adapter's and the first status has to hash the file.
+        await manager.status();
+        expect(workTreeReads()).toBeGreaterThan(0);
+
+        readBinary.mockClear();
+        await manager.status();
+        expect(workTreeReads()).toBe(0);
+    });
+});

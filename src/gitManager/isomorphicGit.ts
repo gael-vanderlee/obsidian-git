@@ -994,6 +994,7 @@ export class IsomorphicGit extends GitManager {
         }
         this.hiddenFiles.install();
         for (const [path, stats] of await this.hiddenFiles.getFiles()) {
+            if (path.split("/").includes(".git")) continue;
             if (path.startsWith(prefix))
                 files.set(path.slice(prefix.length), stats);
         }
@@ -1021,7 +1022,10 @@ export class IsomorphicGit extends GitManager {
         await runLimited(queue, 16, async ({ folder, hidden }) => {
             const listing = await this.app.vault.adapter.list(folder);
             for (const child of listing.folders) {
-                if (child === gitDir) continue;
+                // Skip this repository's and any nested repository's git dir.
+                if (child === gitDir || child.split("/").pop() === ".git") {
+                    continue;
+                }
                 if (hidden || isHiddenName(child)) {
                     queue.push({ folder: child, hidden: true });
                 }

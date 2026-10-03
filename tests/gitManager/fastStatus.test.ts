@@ -452,3 +452,43 @@ describe("IsomorphicGit index concurrency", () => {
         expect(await repo.raw(["ls-files"])).toContain("new.md");
     });
 });
+
+describe("IsomorphicGit nested repositories", () => {
+    it("never reports or commits files inside nested .git folders", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        write(
+            repo,
+            ".obsidian/plugins/p/.git/config",
+            "[remote]\n\turl = https://user:SECRET@example.com/x.git\n"
+        );
+        write(repo, "sub/.git/HEAD", "ref: refs/heads/main\n");
+        write(repo, "sub/note.md", "note\n");
+        const { manager } = createIsomorphicGitManager(repo.repoPath);
+
+        const status = normalize(await manager.status());
+
+        expect(status.changed.join("\n")).not.toContain(".git/");
+        expect(status.changed).toContain("UU sub/note.md");
+
+        await manager.commitAll({ message: "all" });
+        expect(await repo.raw(["ls-files"])).not.toContain(".git/");
+    });
+
+    it("ignores files inside a submodule path", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const head = await repo.head();
+        await repo.raw([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            `160000,${head},sub`,
+        ]);
+        await repo.git.commit("add submodule");
+        write(repo, "sub/file.md", "inside the submodule\n");
+        const { manager } = createIsomorphicGitManager(repo.repoPath);
+
+        const status = normalize(await manager.status());
+
+        expect(status.all).toEqual([]);
+    });
+});

@@ -121,6 +121,7 @@ export class HiddenFileTracker {
 
     private recordChange(rawPath: string): void {
         const path = rawPath.replace(/^\/+|\/+$/g, "");
+        if (path.split("/").includes(".git")) return;
         if (isHiddenPath(path) && !this.isExcluded(path)) this.dirty.add(path);
     }
 

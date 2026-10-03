@@ -506,6 +506,8 @@ describe("IsomorphicGit hidden tracking robustness", () => {
         write(repo, "dir/.hidden/e.md", "e\n");
         await repo.git.add(".");
         await repo.git.commit("hidden");
+        // Let the files settle so stats alone decide (no same-second re-hash).
+        await new Promise((resolve) => setTimeout(resolve, 2100));
         return { repo, ...createIsomorphicGitManager(repo.repoPath) };
     }
 

@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import path from "path";
 import git from "isomorphic-git";
 import { describe, expect, it, vi } from "vitest";
@@ -104,7 +104,13 @@ describe("IsomorphicGit fast status", () => {
                     const full = path.join(repo.repoPath, file);
                     if (action === "write") {
                         // Grow the file so same-second rewrites change the size.
-                        const size = (sizes.get(file) ?? 0) + 1 + step;
+                        // Always larger than any earlier version, committed or not,
+                        // so statusMatrix (seconds + size) can't miss the change.
+                        const existing = existsSync(full)
+                            ? readFileSync(full).length
+                            : 0;
+                        const size =
+                            Math.max(sizes.get(file) ?? 0, existing) + 1 + step;
                         sizes.set(file, size);
                         const content = "x".repeat(size) + "\n";
                         if (mode === "adapter" && isHidden(file)) {

@@ -346,8 +346,10 @@ export class IsomorphicGit extends GitManager {
                 let built:
                     { tree: string; dirs: Map<string, string> } | undefined;
                 let index: IndexSnapshot | undefined;
+                let headCommit: string | undefined;
                 if (!amend) {
                     const head = await this.getHeadSnapshot();
+                    headCommit = head.commit || undefined;
                     index = await this.readIndexSnapshot();
                     changes = await this.getIndexChanges(head, index);
                     if (
@@ -367,14 +369,9 @@ export class IsomorphicGit extends GitManager {
                         tree: built?.tree,
                     })
                 );
-                if (changes && !parent) {
-                    const { commit: created } = await git.readCommit({
-                        ...this.getRepo(),
-                        oid,
-                    });
-                    if (created.parent.length === 1) {
-                        this.rememberChanges(created.parent[0]!, oid, changes);
-                    }
+                if (changes && !parent && headCommit) {
+                    // A plain commit's only parent is the HEAD it was built on.
+                    this.rememberChanges(headCommit, oid, changes);
                 }
                 if (built && index) {
                     this.headTree = {
@@ -396,7 +393,7 @@ export class IsomorphicGit extends GitManager {
                 }
                 const committedFiles =
                     changes?.length ?? (await this.getCommittedFilesCount(oid));
-                await this.clearMergeState();
+                if (mergeHeads.length > 0) await this.clearMergeState();
                 this.plugin.setPluginState({ mergeInProgress: false });
                 return committedFiles;
             } catch (error) {

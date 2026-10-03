@@ -67,6 +67,12 @@ export class IsomorphicGit extends GitManager {
     };
     private readonly noticeLength = 999_999;
     private readonly fs = new MyAdapter(this.app.vault, this.plugin);
+    /** Use the index and Obsidian's file cache for status instead of a full walk. */
+    useFastStatus = true;
+    // Blob oids of the HEAD tree by path, cached per HEAD commit.
+    private headTree?: { commit: string; files: Map<string, string> };
+    // isIgnored results, valid while the .gitignore files are unchanged.
+    private ignoredCache?: { signature: string; results: Map<string, boolean> };
     // Last remote tip seen; lets push reuse the probe made by the preceding pull.
     private remoteTip?: { url: string; ref: string; oid?: string; at: number };
 
@@ -192,17 +198,23 @@ export class IsomorphicGit extends GitManager {
             );
         }, 20000);
         try {
-            const statusOpts = { ...this.getRepo() } as Parameters<
-                typeof git.statusMatrix
-            >[0];
-            if (opts?.path != undefined) {
-                statusOpts.filepaths = [`${opts.path}/`];
+            const fast = await this.fastStatusRows(opts?.path);
+            let rows: StatusRow[];
+            if (fast) {
+                rows = fast.rows;
+            } else {
+                const statusOpts = { ...this.getRepo() } as Parameters<
+                    typeof git.statusMatrix
+                >[0];
+                if (opts?.path != undefined) {
+                    statusOpts.filepaths = [`${opts.path}/`];
+                }
+                rows = await this.wrapFS(git.statusMatrix(statusOpts));
             }
-            const status = (
-                await this.wrapFS(git.statusMatrix(statusOpts))
-            ).map((row) => this.getFileStatusResult(row));
+            const status = rows.map((row) => this.getFileStatusResult(row));
 
-            let conflicted = await this.getConflictedFiles();
+            let conflicted =
+                fast?.conflicted ?? (await this.getConflictedFiles());
             if (opts?.path != undefined) {
                 const path = opts.path.replace(/\/$/, "");
                 conflicted = conflicted.filter(
@@ -682,6 +694,249 @@ export class IsomorphicGit extends GitManager {
                 throw error;
             }
         });
+    }
+
+    /**
+     * statusMatrix-compatible rows (unchanged files omitted) from the index,
+     * Obsidian's in-memory file stats and a cached HEAD tree. Only hidden
+     * paths, which Obsidian does not track, need file system calls; file
+     * contents are hashed only when their stats changed.
+     */
+    private async fastStatusRows(
+        path?: string
+    ): Promise<{ rows: StatusRow[]; conflicted: string[] } | undefined> {
+        if (!this.useFastStatus || this.plugin.settings.gitDir)
+            return undefined;
+        try {
+            const prefix =
+                path !== undefined ? `${path.replace(/\/$/, "")}/` : "";
+            const [working, head] = await Promise.all([
+                this.listWorkingTree(),
+                this.getHeadTree(),
+            ]);
+            const isIgnored = this.getIgnoreChecker(working);
+            const indexPath = normalizePath(`${this.getGitDirPath()}/index`);
+            const result = GitIndexManager.acquire(
+                {
+                    fs: new FileSystem(this.fs),
+                    gitdir: this.getGitDirPath(),
+                    cache: {},
+                },
+                async (rawIndex: unknown) => {
+                    const index = rawIndex as GitIndexLike;
+                    const indexStat = await this.fs
+                        .stat(indexPath)
+                        .catch(() => undefined);
+                    const indexSeconds = indexStat
+                        ? Math.floor(indexStat.mtimeMs / 1000)
+                        : Infinity;
+                    const unmerged = new Set(index.unmergedPaths);
+                    const paths = new Set<string>([
+                        ...head.keys(),
+                        ...index.entriesMap.keys(),
+                        ...working.keys(),
+                    ]);
+                    const rows: StatusRow[] = [];
+                    for (const filepath of [...paths].sort()) {
+                        if (!filepath.startsWith(prefix)) continue;
+                        const entry = index.entriesMap.get(filepath);
+                        if (entry?.mode === 0o160000) continue;
+                        const headOid = head.get(filepath);
+                        const stageOid = entry?.oid;
+                        const stats = working.get(filepath);
+                        let workOid: string | undefined;
+                        if (stats) {
+                            const mtime = Math.floor(stats.mtimeMs / 1000);
+                            if (
+                                entry &&
+                                entry.mtimeSeconds === mtime &&
+                                entry.ctimeSeconds ===
+                                    Math.floor(stats.ctimeMs / 1000) &&
+                                entry.size === stats.size &&
+                                mtime < indexSeconds
+                            ) {
+                                workOid = entry.oid;
+                            } else if (!entry && headOid === undefined) {
+                                if (await isIgnored(filepath)) continue;
+                                workOid = "untracked";
+                            } else {
+                                workOid = await this.hashWorkingFile(filepath);
+                                if (
+                                    entry &&
+                                    workOid === entry.oid &&
+                                    !unmerged.has(filepath)
+                                ) {
+                                    index.insert({
+                                        filepath,
+                                        oid: entry.oid,
+                                        stats: {
+                                            ...STABLE_INDEX_STATS,
+                                            ctimeMs: stats.ctimeMs,
+                                            mtimeMs: stats.mtimeMs,
+                                            size: stats.size,
+                                            mode: entry.mode,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                        const headCode = headOid !== undefined ? 1 : 0;
+                        const workCode =
+                            workOid === undefined
+                                ? 0
+                                : workOid === headOid
+                                  ? 1
+                                  : 2;
+                        const stageCode =
+                            stageOid === undefined
+                                ? 0
+                                : stageOid === headOid
+                                  ? 1
+                                  : stageOid === workOid
+                                    ? 2
+                                    : 3;
+                        if (
+                            headCode === 1 &&
+                            workCode === 1 &&
+                            stageCode === 1
+                        ) {
+                            continue;
+                        }
+                        rows.push([filepath, headCode, workCode, stageCode]);
+                    }
+                    return {
+                        rows,
+                        conflicted: [...unmerged].filter((file) =>
+                            file.startsWith(prefix)
+                        ),
+                    };
+                }
+            ) as Promise<{ rows: StatusRow[]; conflicted: string[] }>;
+            return await this.wrapFS(result);
+        } catch (error) {
+            this.plugin.log("Fast status failed, using statusMatrix", error);
+            return undefined;
+        }
+    }
+
+    /** Repo-relative paths of working tree files with their stats. */
+    private async listWorkingTree(): Promise<Map<string, WorkingFileStats>> {
+        const base = this.plugin.settings.basePath;
+        const prefix = base ? `${base}/` : "";
+        const toRepoPath = (vaultPath: string) =>
+            vaultPath.slice(prefix.length);
+        const inRepo = (vaultPath: string) =>
+            prefix === "" || vaultPath.startsWith(prefix);
+        const files = new Map<string, WorkingFileStats>();
+        for (const file of this.app.vault.getFiles()) {
+            if (!inRepo(file.path)) continue;
+            files.set(toRepoPath(file.path), {
+                ctimeMs: file.stat.ctime,
+                mtimeMs: file.stat.mtime,
+                size: file.stat.size,
+            });
+        }
+
+        // Obsidian does not index dot-files and dot-folders. Find them by
+        // listing every folder it knows, then everything below hidden ones.
+        const gitDir = this.getGitDirPath();
+        const folders = this.app.vault
+            .getAllLoadedFiles()
+            .filter((file) => "children" in file)
+            .map((folder) => folder.path)
+            .filter((folder) =>
+                folder === "/"
+                    ? prefix === ""
+                    : inRepo(`${folder}/`) || folder === base
+            );
+        const queue: { folder: string; hidden: boolean }[] = folders.map(
+            (folder) => ({ folder, hidden: false })
+        );
+        const isHiddenName = (vaultPath: string) =>
+            vaultPath.split("/").pop()!.startsWith(".");
+        await runLimited(queue, 16, async ({ folder, hidden }) => {
+            const listing = await this.app.vault.adapter.list(folder);
+            for (const child of listing.folders) {
+                if (child === gitDir) continue;
+                if (hidden || isHiddenName(child)) {
+                    queue.push({ folder: child, hidden: true });
+                }
+            }
+            const statTargets = listing.files.filter(
+                (child) => hidden || isHiddenName(child)
+            );
+            await Promise.all(
+                statTargets.map(async (child) => {
+                    const stat = await this.app.vault.adapter.stat(child);
+                    if (stat?.type === "file" && inRepo(child)) {
+                        files.set(toRepoPath(child), {
+                            ctimeMs: stat.ctime,
+                            mtimeMs: stat.mtime,
+                            size: stat.size,
+                        });
+                    }
+                })
+            );
+        });
+        return files;
+    }
+
+    /** Blob oids of the HEAD tree by repo path; empty before the first commit. */
+    private async getHeadTree(): Promise<Map<string, string>> {
+        let commit: string;
+        try {
+            commit = await this.resolveRef("HEAD");
+        } catch (error) {
+            if (error instanceof Errors.NotFoundError) return new Map();
+            throw error;
+        }
+        if (this.headTree?.commit === commit) return this.headTree.files;
+        const files = new Map<string, string>();
+        await git.walk({
+            ...this.getRepo(),
+            trees: [git.TREE({ ref: commit })],
+            map: async (filepath, [entry]) => {
+                if (filepath === "." || !entry) return;
+                const type = await entry.type();
+                if (type === "blob") files.set(filepath, await entry.oid());
+                return type === "tree" ? undefined : null;
+            },
+        });
+        this.headTree = { commit, files };
+        return files;
+    }
+
+    private async hashWorkingFile(filepath: string): Promise<string> {
+        const content = await this.app.vault.adapter.readBinary(
+            this.getRelativeVaultPath(filepath)
+        );
+        return (await git.hashBlob({ object: new Uint8Array(content) })).oid;
+    }
+
+    /** isIgnored with results cached until a .gitignore file changes. */
+    private getIgnoreChecker(
+        working: Map<string, WorkingFileStats>
+    ): (filepath: string) => Promise<boolean> {
+        const signature = [...working]
+            .filter(
+                ([file]) =>
+                    file === ".gitignore" || file.endsWith("/.gitignore")
+            )
+            .map(([file, stat]) => `${file}:${stat.mtimeMs}:${stat.size}`)
+            .sort()
+            .join("|");
+        if (this.ignoredCache?.signature !== signature) {
+            this.ignoredCache = { signature, results: new Map() };
+        }
+        const results = this.ignoredCache.results;
+        return async (filepath) => {
+            let ignored = results.get(filepath);
+            if (ignored === undefined) {
+                ignored = await git.isIgnored({ ...this.getRepo(), filepath });
+                results.set(filepath, ignored);
+            }
+            return ignored;
+        };
     }
 
     private getCredentials(): RemoteCredentials {
@@ -1745,4 +2000,56 @@ async function inflateIfGzipped(buffer: ArrayBuffer): Promise<ArrayBuffer> {
         // bytes so behavior is no worse than before.
         return buffer;
     }
+}
+
+type WorkingFileStats = { ctimeMs: number; mtimeMs: number; size: number };
+
+// The parts of isomorphic-git's untyped GitIndex used by the fast status.
+type GitIndexLike = {
+    entriesMap: Map<
+        string,
+        {
+            oid: string;
+            mode: number;
+            mtimeSeconds: number;
+            ctimeSeconds: number;
+            size: number;
+        }
+    >;
+    unmergedPaths: string[];
+    insert(entry: {
+        filepath: string;
+        oid: string;
+        stats: Record<string, number>;
+    }): void;
+};
+
+// Matches MyAdapter's placeholders so refreshed entries compare equal later.
+const STABLE_INDEX_STATS = { uid: 0, gid: 0, ino: 0, dev: 0 };
+
+/** Runs `worker` over a queue that may grow while running, `limit` at a time. */
+async function runLimited<T>(
+    queue: T[],
+    limit: number,
+    worker: (item: T) => Promise<void>
+): Promise<void> {
+    let next = 0;
+    let active = 0;
+    await new Promise<void>((resolve, reject) => {
+        const pump = () => {
+            if (next >= queue.length && active === 0) {
+                resolve();
+                return;
+            }
+            while (active < limit && next < queue.length) {
+                const item = queue[next++]!;
+                active++;
+                worker(item).then(() => {
+                    active--;
+                    pump();
+                }, reject);
+            }
+        };
+        pump();
+    });
 }

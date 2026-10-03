@@ -1,3 +1,4 @@
+import { readdirSync, statSync } from "fs";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "fs/promises";
 import path from "path";
 import { vi } from "vitest";
@@ -76,8 +77,48 @@ function createNodeVault(root: string) {
             rm(resolve(vaultPath), { recursive: true, force: true }),
     };
 
+    // Mirrors Obsidian's in-memory file index, which skips dot-files and dot-folders.
+    const loadedFiles = () => {
+        const files: {
+            path: string;
+            stat: { ctime: number; mtime: number; size: number };
+        }[] = [];
+        const folders: { path: string; children: unknown[] }[] = [
+            { path: "/", children: [] },
+        ];
+        const visit = (vaultPath: string) => {
+            for (const entry of readdirSync(resolve(vaultPath), {
+                withFileTypes: true,
+            })) {
+                if (entry.name.startsWith(".")) continue;
+                const child = relative(vaultPath, entry.name);
+                if (entry.isDirectory()) {
+                    folders.push({ path: child, children: [] });
+                    visit(child);
+                } else if (entry.isFile()) {
+                    const result = statSync(resolve(child));
+                    files.push({
+                        path: child,
+                        stat: {
+                            ctime: result.ctimeMs,
+                            mtime: result.mtimeMs,
+                            size: result.size,
+                        },
+                    });
+                }
+            }
+        };
+        visit("/");
+        return { files, folders };
+    };
+
     return {
         adapter,
+        getFiles: () => loadedFiles().files,
+        getAllLoadedFiles: () => {
+            const { files, folders } = loadedFiles();
+            return [...folders, ...files];
+        },
         create: adapter.write,
         createBinary: adapter.writeBinary,
         createFolder: (vaultPath: string) =>

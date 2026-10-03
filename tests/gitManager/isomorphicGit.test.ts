@@ -210,6 +210,7 @@ describe("IsomorphicGit.status", () => {
     it("does not re-read unchanged files once the index stats are refreshed", async () => {
         const repo = withCleanup(await createRepoWithOrigin());
         const { manager, plugin } = createIsomorphicGitManager(repo.repoPath);
+        manager.useFastStatus = false;
         const adapter = plugin.app.vault.adapter;
         const readBinary = vi.spyOn(adapter, "readBinary");
         const workTreeReads = () =>

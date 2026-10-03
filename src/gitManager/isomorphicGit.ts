@@ -30,6 +30,11 @@ import { GeneralModal } from "../ui/modals/generalModal";
 import { splitRemoteBranch, worthWalking } from "../utils";
 import { GitManager } from "./gitManager";
 import { MyAdapter } from "./myAdapter";
+import {
+    advertiseReceivePack,
+    sendReceivePack,
+    type RemoteCredentials,
+} from "./smartHttp";
 import diff3Merge from "diff3";
 
 export class IsomorphicGit extends GitManager {
@@ -62,6 +67,8 @@ export class IsomorphicGit extends GitManager {
     };
     private readonly noticeLength = 999_999;
     private readonly fs = new MyAdapter(this.app.vault, this.plugin);
+    // Last remote tip seen; lets push reuse the probe made by the preceding pull.
+    private remoteTip?: { url: string; ref: string; oid?: string; at: number };
 
     constructor(plugin: ObsidianGit) {
         super(plugin);
@@ -511,6 +518,16 @@ export class IsomorphicGit extends GitManager {
                     return { status: "skipped", reason: "no-upstream" };
                 }
 
+                if (
+                    await this.isUpToDateWithRemote(
+                        localCommit,
+                        branchInfo.tracking,
+                        branchInfo.remote
+                    )
+                ) {
+                    return { status: "up-to-date" };
+                }
+
                 await this.fetch();
 
                 await this.checkAuthorInfo();
@@ -625,14 +642,23 @@ export class IsomorphicGit extends GitManager {
                     this.plugin.log("No tracking branch found. Ignoring push.");
                     return { status: "skipped", reason: "no-upstream" };
                 }
+                const remote = await this.getCurrentRemote();
+                const fastResult = await this.tryFastPush(
+                    currentBranch,
+                    trackingBranch,
+                    remote
+                );
+                if (fastResult !== undefined) {
+                    progressNotice?.hide();
+                    return fastResult;
+                }
+
                 const numChangedFiles = (
                     await this.getFileChangesCount(
                         currentBranch,
                         trackingBranch
                     )
                 ).length;
-
-                const remote = await this.getCurrentRemote();
 
                 await this.wrapFS(
                     git.push({
@@ -656,6 +682,199 @@ export class IsomorphicGit extends GitManager {
                 throw error;
             }
         });
+    }
+
+    private getCredentials(): RemoteCredentials {
+        return {
+            username: this.plugin.localStorage.getUsername() ?? undefined,
+            password: this.plugin.localStorage.getPassword() ?? undefined,
+        };
+    }
+
+    /** Asks the remote for a branch tip; undefined when it can't be asked directly. */
+    private async probeRemoteTip(
+        remote: string,
+        ref: string,
+        maxAgeMs = 0
+    ): Promise<{ url: string; oid?: string } | undefined> {
+        const url = await this.getRemoteUrl(remote);
+        if (!url || !/^https?:\/\//.test(url) || new URL(url).username) {
+            return undefined;
+        }
+        const cached = this.remoteTip;
+        if (
+            cached?.url === url &&
+            cached.ref === ref &&
+            Date.now() - cached.at <= maxAgeMs
+        ) {
+            return cached;
+        }
+        const advertisement = await advertiseReceivePack(
+            url,
+            this.getCredentials()
+        );
+        if (!advertisement) return undefined;
+        this.remoteTip = {
+            url,
+            ref,
+            oid: advertisement.refs.get(ref),
+            at: Date.now(),
+        };
+        return this.remoteTip;
+    }
+
+    /** True when the remote branch still equals the tracking ref and HEAD contains it. */
+    private async isUpToDateWithRemote(
+        localCommit: string,
+        tracking: string,
+        remote: string
+    ): Promise<boolean> {
+        try {
+            const branch = splitRemoteBranch(tracking)[1];
+            if (!branch) return false;
+            const tip = await this.probeRemoteTip(
+                remote,
+                `refs/heads/${branch}`
+            );
+            if (tip?.oid === undefined) return false;
+            if (tip.oid !== (await this.resolveRef(tracking))) return false;
+            return (
+                tip.oid === localCommit ||
+                (await git.isDescendent({
+                    ...this.getRepo(),
+                    oid: localCommit,
+                    ancestor: tip.oid,
+                    depth: 100,
+                }))
+            );
+        } catch (error) {
+            this.plugin.log("Remote probe failed, fetching instead", error);
+            return false;
+        }
+    }
+
+    /** Pushes the new objects directly; undefined means use the regular push. */
+    private async tryFastPush(
+        currentBranch: string,
+        tracking: string,
+        remote: string
+    ): Promise<PushResult | undefined> {
+        try {
+            const branch = splitRemoteBranch(tracking)[1];
+            if (!branch) return undefined;
+            const ref = `refs/heads/${branch}`;
+            const localOid = await this.resolveRef(currentBranch);
+            const trackingOid = await this.resolveRef(tracking);
+            const tip = await this.probeRemoteTip(remote, ref, 60_000);
+            if (tip?.oid === undefined || tip.oid !== trackingOid) {
+                return undefined;
+            }
+            if (localOid === trackingOid) return { status: "up-to-date" };
+
+            const commits = await this.commitsSince(localOid, trackingOid);
+            if (!commits) return undefined;
+            const { oids, changedFiles } =
+                await this.collectPushObjects(commits);
+            const { packfile } = await git.packObjects({
+                ...this.getRepo(),
+                oids: [...oids],
+            });
+            if (!packfile) return undefined;
+            this.remoteTip = undefined;
+            const result = await sendReceivePack({
+                url: tip.url,
+                credentials: this.getCredentials(),
+                ref,
+                oldOid: trackingOid,
+                newOid: localOid,
+                pack: packfile,
+            });
+            if (!result.ok) {
+                this.plugin.log(`Fast push rejected: ${result.reason}`);
+                return undefined;
+            }
+            await git.writeRef({
+                ...this.getRepo(),
+                ref: `refs/remotes/${remote}/${branch}`,
+                value: localOid,
+                force: true,
+            });
+            const files =
+                changedFiles ??
+                (await this.getFileChangesCount(localOid, trackingOid)).length;
+            return files === 0
+                ? { status: "up-to-date" }
+                : { status: "pushed", files };
+        } catch (error) {
+            this.plugin.log("Fast push failed, using regular push", error);
+            return undefined;
+        }
+    }
+
+    /** Commits reachable from `head` but not from `stop`, or undefined if that is not a short, complete chain. */
+    private async commitsSince(
+        head: string,
+        stop: string
+    ): Promise<{ oid: string; parents: string[] }[] | undefined> {
+        const result: { oid: string; parents: string[] }[] = [];
+        const queue = [head];
+        const seen = new Set<string>();
+        while (queue.length > 0) {
+            const oid = queue.shift()!;
+            if (oid === stop || seen.has(oid)) continue;
+            seen.add(oid);
+            if (seen.size > 50) return undefined;
+            const { commit } = await git.readCommit({ ...this.getRepo(), oid });
+            if (commit.parent.length === 0) return undefined;
+            result.push({ oid, parents: commit.parent });
+            queue.push(...commit.parent);
+        }
+        return result;
+    }
+
+    /**
+     * Objects of the given commits that none of their parents has at the same
+     * path. Every parent is either the remote tip or one of the commits, so
+     * this covers everything the remote is missing.
+     */
+    private async collectPushObjects(
+        commits: { oid: string; parents: string[] }[]
+    ): Promise<{ oids: Set<string>; changedFiles?: number }> {
+        const oids = new Set<string>();
+        const countFiles =
+            commits.length === 1 && commits[0]!.parents.length === 1;
+        let changedFiles = 0;
+        for (const commit of commits) {
+            oids.add(commit.oid);
+            await git.walk({
+                ...this.getRepo(),
+                trees: [
+                    git.TREE({ ref: commit.oid }),
+                    ...commit.parents.map((ref) => git.TREE({ ref })),
+                ],
+                map: async (_filepath, [entry, ...parents]) => {
+                    if (!entry) {
+                        // Deleted: nothing to send, only count removed files.
+                        const type = await parents[0]?.type();
+                        if (type === "blob") changedFiles++;
+                        return type === "tree" && countFiles ? undefined : null;
+                    }
+                    const type = await entry.type();
+                    if (type === "commit") return null;
+                    const oid = await entry.oid();
+                    const parentOids = await Promise.all(
+                        parents.map((parent) =>
+                            parent ? parent.oid() : Promise.resolve(undefined)
+                        )
+                    );
+                    if (parentOids.includes(oid)) return null;
+                    oids.add(oid);
+                    if (type === "blob") changedFiles++;
+                    return type === "tree" ? undefined : null;
+                },
+            });
+        }
+        return { oids, changedFiles: countFiles ? changedFiles : undefined };
     }
 
     async getUnpushedCommits(): Promise<number> {

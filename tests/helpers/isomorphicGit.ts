@@ -80,6 +80,8 @@ function createNodeVault(root: string) {
         adapter,
         create: adapter.write,
         createBinary: adapter.writeBinary,
+        createFolder: (vaultPath: string) =>
+            mkdir(resolve(vaultPath), { recursive: true }),
         getAbstractFileByPath: () => null,
         getFolderByPath: () => null,
     };

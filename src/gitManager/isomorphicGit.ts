@@ -79,6 +79,18 @@ export class IsomorphicGit extends GitManager {
             path.startsWith(`${this.getGitDirPath()}/`),
         (...data) => this.plugin.log(...data)
     );
+    // Files whose content was hashed and matched the index despite changed
+    // stats. Kept in memory instead of refreshing the index (see fastStatusRows).
+    private readonly verifiedStats = new Map<
+        string,
+        {
+            oid: string;
+            mtimeMs: number;
+            ctimeSeconds: number;
+            size: number;
+            verifiedSeconds: number;
+        }
+    >();
     // Blob oids of the HEAD tree by path, cached per HEAD commit.
     private headTree?: HeadSnapshot;
     // isIgnored results, valid while the .gitignore files are unchanged.
@@ -781,7 +793,9 @@ export class IsomorphicGit extends GitManager {
      * statusMatrix-compatible rows (unchanged files omitted) from the index,
      * Obsidian's in-memory file stats and a cached HEAD tree. Only hidden
      * paths, which Obsidian does not track, need file system calls; file
-     * contents are hashed only when their stats changed.
+     * contents are hashed only when their stats changed. The index is only
+     * read here: writes from outside isomorphic-git's own lock could clobber
+     * concurrent index updates.
      */
     private async fastStatusRows(
         path?: string
@@ -791,117 +805,178 @@ export class IsomorphicGit extends GitManager {
         try {
             const prefix =
                 path !== undefined ? `${path.replace(/\/$/, "")}/` : "";
-            const [working, head] = await Promise.all([
+            const [working, head, index] = await Promise.all([
                 this.listWorkingTree(),
                 this.getHeadTree(),
+                this.readIndexForStatus(),
             ]);
             const isIgnored = this.getIgnoreChecker(working);
-            const indexPath = normalizePath(`${this.getGitDirPath()}/index`);
-            const result = GitIndexManager.acquire(
-                {
-                    fs: new FileSystem(this.fs),
-                    gitdir: this.getGitDirPath(),
-                    cache: {},
+            const gitlinks = [...index.gitlinks].map((link) => `${link}/`);
+            // A file is trusted by its stats only if it was last written at least
+            // two seconds before they were recorded (coarse FAT timestamps).
+            const settled = (mtimeMs: number, recordedSeconds: number) =>
+                Math.floor(mtimeMs / 1000) + 1 < recordedSeconds;
+            const sameStats = (
+                recorded: {
+                    mtimeMs: number;
+                    ctimeSeconds: number;
+                    size: number;
                 },
-                async (rawIndex: unknown) => {
-                    const index = rawIndex as GitIndexLike;
-                    const indexStat = await this.fs
-                        .stat(indexPath)
-                        .catch(() => undefined);
-                    const indexSeconds = indexStat
-                        ? Math.floor(indexStat.mtimeMs / 1000)
-                        : Infinity;
-                    const unmerged = new Set(index.unmergedPaths);
-                    const paths = new Set<string>([
-                        ...head.keys(),
-                        ...index.entriesMap.keys(),
-                        ...working.keys(),
-                    ]);
-                    const rows: StatusRow[] = [];
-                    for (const filepath of [...paths].sort()) {
-                        if (!filepath.startsWith(prefix)) continue;
-                        const entry = index.entriesMap.get(filepath);
-                        if (entry?.mode === 0o160000) continue;
-                        const headOid = head.get(filepath);
-                        const stageOid = entry?.oid;
-                        const stats = working.get(filepath);
-                        let workOid: string | undefined;
-                        if (stats) {
-                            const mtime = Math.floor(stats.mtimeMs / 1000);
-                            // Compare mtime to the millisecond: an edit that keeps
-                            // the size within the same second must not look clean.
-                            if (
-                                entry &&
-                                entry.mtimeSeconds * 1000 +
-                                    Math.floor(entry.mtimeNanoseconds / 1e6) ===
-                                    Math.floor(stats.mtimeMs) &&
-                                entry.ctimeSeconds ===
-                                    Math.floor(stats.ctimeMs / 1000) &&
-                                entry.size === stats.size &&
-                                mtime < indexSeconds
-                            ) {
-                                workOid = entry.oid;
-                            } else if (!entry && headOid === undefined) {
-                                if (await isIgnored(filepath)) continue;
-                                workOid = "untracked";
-                            } else {
-                                workOid = await this.hashWorkingFile(filepath);
-                                if (
-                                    entry &&
-                                    workOid === entry.oid &&
-                                    !unmerged.has(filepath)
-                                ) {
-                                    index.insert({
-                                        filepath,
-                                        oid: entry.oid,
-                                        stats: {
-                                            ...STABLE_INDEX_STATS,
-                                            ctimeMs: stats.ctimeMs,
-                                            mtimeMs: stats.mtimeMs,
-                                            size: stats.size,
-                                            mode: entry.mode,
-                                        },
-                                    });
-                                }
-                            }
+                stats: WorkingFileStats
+            ) =>
+                recorded.mtimeMs === Math.floor(stats.mtimeMs) &&
+                recorded.ctimeSeconds === Math.floor(stats.ctimeMs / 1000) &&
+                recorded.size === stats.size;
+            const paths = new Set<string>([
+                ...head.keys(),
+                ...index.entries.keys(),
+                ...working.keys(),
+            ]);
+            const rows: StatusRow[] = [];
+            for (const filepath of [...paths].sort()) {
+                if (!filepath.startsWith(prefix)) continue;
+                // Never report repositories nested in the working tree.
+                if (gitlinks.some((link) => filepath.startsWith(link)))
+                    continue;
+                if (index.gitlinks.has(filepath)) continue;
+                const entry = index.entries.get(filepath);
+                const headOid = head.get(filepath);
+                const stats = working.get(filepath);
+                let workOid: string | undefined;
+                if (stats) {
+                    const verified = this.verifiedStats.get(filepath);
+                    if (
+                        entry &&
+                        sameStats(entry, stats) &&
+                        settled(stats.mtimeMs, index.writtenSeconds)
+                    ) {
+                        workOid = entry.oid;
+                    } else if (
+                        entry &&
+                        verified?.oid === entry.oid &&
+                        sameStats(verified, stats) &&
+                        settled(stats.mtimeMs, verified.verifiedSeconds)
+                    ) {
+                        workOid = entry.oid;
+                    } else if (!entry && headOid === undefined) {
+                        if (await isIgnored(filepath)) continue;
+                        workOid = "untracked";
+                    } else {
+                        const verifiedSeconds = Math.floor(Date.now() / 1000);
+                        workOid = await this.hashWorkingFile(filepath);
+                        if (workOid === undefined) {
+                            // Gone since it was listed: treat as deleted, rescan.
+                            this.hiddenFiles.invalidate();
+                        } else if (entry && workOid === entry.oid) {
+                            this.verifiedStats.set(filepath, {
+                                oid: workOid,
+                                mtimeMs: Math.floor(stats.mtimeMs),
+                                ctimeSeconds: Math.floor(stats.ctimeMs / 1000),
+                                size: stats.size,
+                                verifiedSeconds,
+                            });
                         }
-                        const headCode = headOid !== undefined ? 1 : 0;
-                        const workCode =
-                            workOid === undefined
-                                ? 0
-                                : workOid === headOid
-                                  ? 1
-                                  : 2;
-                        const stageCode =
-                            stageOid === undefined
-                                ? 0
-                                : stageOid === headOid
-                                  ? 1
-                                  : stageOid === workOid
-                                    ? 2
-                                    : 3;
-                        if (
-                            headCode === 1 &&
-                            workCode === 1 &&
-                            stageCode === 1
-                        ) {
-                            continue;
-                        }
-                        rows.push([filepath, headCode, workCode, stageCode]);
                     }
-                    return {
-                        rows,
-                        conflicted: [...unmerged].filter((file) =>
-                            file.startsWith(prefix)
-                        ),
-                    };
                 }
-            ) as Promise<{ rows: StatusRow[]; conflicted: string[] }>;
-            return await this.wrapFS(result);
+                const stageOid = entry?.oid;
+                const headCode = headOid !== undefined ? 1 : 0;
+                const workCode =
+                    workOid === undefined ? 0 : workOid === headOid ? 1 : 2;
+                const stageCode =
+                    stageOid === undefined
+                        ? 0
+                        : stageOid === headOid
+                          ? 1
+                          : stageOid === workOid
+                            ? 2
+                            : 3;
+                if (headCode === 1 && workCode === 1 && stageCode === 1) {
+                    continue;
+                }
+                rows.push([filepath, headCode, workCode, stageCode]);
+            }
+            return {
+                rows,
+                conflicted: index.unmerged.filter((file) =>
+                    file.startsWith(prefix)
+                ),
+            };
         } catch (error) {
             this.plugin.log("Fast status failed, using statusMatrix", error);
             return undefined;
         }
+    }
+
+    /** A read-only copy of what the fast status needs from the index. */
+    private async readIndexForStatus(): Promise<{
+        entries: Map<
+            string,
+            { oid: string; mtimeMs: number; ctimeSeconds: number; size: number }
+        >;
+        gitlinks: Set<string>;
+        unmerged: string[];
+        writtenSeconds: number;
+    }> {
+        const indexPath = normalizePath(`${this.getGitDirPath()}/index`);
+        const result = GitIndexManager.acquire(
+            {
+                fs: new FileSystem(this.fs),
+                gitdir: this.getIndexGitdir(),
+                cache: {},
+            },
+            async (rawIndex: unknown) => {
+                const index = rawIndex as GitIndexLike;
+                const indexStat = await this.fs
+                    .stat(indexPath)
+                    .catch(() => undefined);
+                const entries = new Map<
+                    string,
+                    {
+                        oid: string;
+                        mtimeMs: number;
+                        ctimeSeconds: number;
+                        size: number;
+                    }
+                >();
+                const gitlinks = new Set<string>();
+                for (const [filepath, entry] of index.entriesMap) {
+                    if (entry.mode === 0o160000) {
+                        gitlinks.add(filepath);
+                        continue;
+                    }
+                    entries.set(filepath, {
+                        oid: entry.oid,
+                        mtimeMs:
+                            entry.mtimeSeconds * 1000 +
+                            Math.floor(entry.mtimeNanoseconds / 1e6),
+                        ctimeSeconds: entry.ctimeSeconds,
+                        size: entry.size,
+                    });
+                }
+                return {
+                    entries,
+                    gitlinks,
+                    unmerged: index.unmergedPaths,
+                    writtenSeconds: indexStat
+                        ? Math.floor(indexStat.mtimeMs / 1000)
+                        : 0,
+                };
+            }
+        ) as Promise<{
+            entries: Map<
+                string,
+                {
+                    oid: string;
+                    mtimeMs: number;
+                    ctimeSeconds: number;
+                    size: number;
+                }
+            >;
+            gitlinks: Set<string>;
+            unmerged: string[];
+            writtenSeconds: number;
+        }>;
+        return this.wrapFS(result);
     }
 
     /** Repo-relative paths of working tree files with their stats. */
@@ -1117,10 +1192,20 @@ export class IsomorphicGit extends GitManager {
         return { tree, dirs };
     }
 
-    private async hashWorkingFile(filepath: string): Promise<string> {
-        const content = await this.app.vault.adapter.readBinary(
-            this.getRelativeVaultPath(filepath)
-        );
+    /** Blob oid of a working tree file, or undefined if it no longer exists. */
+    private async hashWorkingFile(
+        filepath: string
+    ): Promise<string | undefined> {
+        const vaultPath = this.getRelativeVaultPath(filepath);
+        let content: ArrayBuffer;
+        try {
+            content = await this.app.vault.adapter.readBinary(vaultPath);
+        } catch (error) {
+            if (!(await this.app.vault.adapter.exists(vaultPath))) {
+                return undefined;
+            }
+            throw error;
+        }
         return (await git.hashBlob({ object: new Uint8Array(content) })).oid;
     }
 
@@ -1784,6 +1869,16 @@ export class IsomorphicGit extends GitManager {
         return Promise.resolve();
     }
 
+    /**
+     * The gitdir string isomorphic-git itself derives from getRepo(). Index
+     * locks are keyed by this string, so every index access must use it.
+     */
+    private getIndexGitdir(): string {
+        const { dir, gitdir } = this.getRepo();
+        if (gitdir) return gitdir;
+        return dir.endsWith("/") ? `${dir}.git` : `${dir}/.git`;
+    }
+
     private getGitDirPath(): string {
         return normalizePath(
             this.getRelativeVaultPath(this.plugin.settings.gitDir || ".git")
@@ -1794,7 +1889,7 @@ export class IsomorphicGit extends GitManager {
         const result = GitIndexManager.acquire(
             {
                 fs: new FileSystem(this.fs),
-                gitdir: this.getGitDirPath(),
+                gitdir: this.getIndexGitdir(),
                 cache: {},
             },
             (index) => index.unmergedPaths as unknown
@@ -2102,7 +2197,7 @@ export class IsomorphicGit extends GitManager {
         const result = GitIndexManager.acquire(
             {
                 fs: new FileSystem(this.fs),
-                gitdir: this.getGitDirPath(),
+                gitdir: this.getIndexGitdir(),
                 cache: {},
             },
             (rawIndex: unknown) => {
@@ -2538,9 +2633,6 @@ type GitIndexLike = {
         stats: Record<string, number>;
     }): void;
 };
-
-// Matches MyAdapter's placeholders so refreshed entries compare equal later.
-const STABLE_INDEX_STATS = { uid: 0, gid: 0, ino: 0, dev: 0 };
 
 /** Runs `worker` over a queue that may grow while running, `limit` at a time. */
 async function runLimited<T>(

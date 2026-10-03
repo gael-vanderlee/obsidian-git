@@ -157,13 +157,13 @@ describe("IsomorphicGit fast status", () => {
         // Touch another tracked file so the next status refreshes and rewrites the index.
         write(repo, "other.md", "other\n");
         // The rewrite then happens in a later second than the edit.
-        await new Promise((resolve) => setTimeout(resolve, 1100));
+        await new Promise((resolve) => setTimeout(resolve, 2100));
 
         expect(normalize(await manager.status()).changed).toEqual([
             " M same.md",
         ]);
         // Once the rewritten index is older than the edit's second, stats decide alone.
-        await new Promise((resolve) => setTimeout(resolve, 1100));
+        await new Promise((resolve) => setTimeout(resolve, 2100));
         expect(normalize(await manager.status()).changed).toEqual([
             " M same.md",
         ]);
@@ -188,7 +188,7 @@ describe("IsomorphicGit fast status", () => {
         const { manager, plugin } = createIsomorphicGitManager(repo.repoPath);
         await manager.status();
         // Let the index become older than the files' mtime second.
-        await new Promise((resolve) => setTimeout(resolve, 1100));
+        await new Promise((resolve) => setTimeout(resolve, 2100));
         await manager.status();
         const readBinary = vi.spyOn(plugin.app.vault.adapter, "readBinary");
         write(repo, "n/3.md", "changed\n");
@@ -367,7 +367,7 @@ describe("IsomorphicGit hidden file tracking", () => {
     it("sees external changes after a scheduled full scan", async () => {
         const { repo, manager } = await setupTracked();
         // Leave the same-second window, where files are always re-hashed.
-        await new Promise((resolve) => setTimeout(resolve, 1100));
+        await new Promise((resolve) => setTimeout(resolve, 2100));
         await manager.status();
         write(repo, ".obsidian/app.json", '{"external":true}\n');
 
@@ -407,5 +407,48 @@ describe("IsomorphicGit hidden file tracking", () => {
 
         expect(manager.hiddenFiles.installed).toBe(false);
         expect(adapter.write).not.toBe(wrapped);
+    });
+});
+
+describe("IsomorphicGit index concurrency", () => {
+    it("does not drop a file staged while a status is running", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        write(repo, "slow.md", "slow\n");
+        await repo.git.add(".");
+        await repo.git.commit("slow");
+        const { manager, plugin } = createIsomorphicGitManager(repo.repoPath);
+        await manager.status();
+        await new Promise((resolve) => setTimeout(resolve, 2100));
+        // Same content, new mtime: status re-hashes it and refreshes the index.
+        write(repo, "slow.md", "slow\n");
+        write(repo, "new.md", "new\n");
+        const adapter = plugin.app.vault.adapter;
+        const readBinary = adapter.readBinary.bind(adapter);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        let reached!: () => void;
+        const reachedSlow = new Promise<void>((resolve) => (reached = resolve));
+        vi.spyOn(adapter, "readBinary").mockImplementation(
+            async (p: string) => {
+                if (p.endsWith("slow.md")) {
+                    reached();
+                    await gate;
+                }
+                return readBinary(p);
+            }
+        );
+
+        const status = manager.status();
+        await reachedSlow;
+        // Stage while the status still holds its view of the index.
+        const stage = manager.stage("new.md", false);
+        await Promise.race([
+            stage,
+            new Promise((resolve) => setTimeout(resolve, 500)),
+        ]);
+        release();
+        await Promise.all([status, stage]);
+
+        expect(await repo.raw(["ls-files"])).toContain("new.md");
     });
 });

@@ -282,13 +282,15 @@ export class MyAdapter {
     }
 
     async saveAndClear(): Promise<void> {
-        if (this.index !== undefined) {
-            await this.adapter.writeBinary(this.getIndexPath(), this.index, {
+        const index = this.index;
+        if (index !== undefined) {
+            await this.adapter.writeBinary(this.getIndexPath(), index, {
                 ctime: this.indexctime,
                 mtime: this.indexmtime,
             });
         }
-        this.clearIndex();
+        // Another operation may have written a newer index meanwhile; keep it.
+        if (this.index === index) this.clearIndex();
     }
 
     clearIndex() {

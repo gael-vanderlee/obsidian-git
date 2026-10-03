@@ -43,6 +43,7 @@ export class MyAdapter {
     indexctime: number | undefined;
     indexmtime: number | undefined;
     lastBasePath: string | undefined;
+    private indexWrites: Promise<unknown> = Promise.resolve();
 
     constructor(
         vault: Vault,
@@ -284,10 +285,13 @@ export class MyAdapter {
     async saveAndClear(): Promise<void> {
         const index = this.index;
         if (index !== undefined) {
-            await this.adapter.writeBinary(this.getIndexPath(), index, {
-                ctime: this.indexctime,
-                mtime: this.indexmtime,
-            });
+            const options = { ctime: this.indexctime, mtime: this.indexmtime };
+            // Chain the writes so an older index can never land after a newer one.
+            const write = this.indexWrites.then(() =>
+                this.adapter.writeBinary(this.getIndexPath(), index, options)
+            );
+            this.indexWrites = write.catch(() => undefined);
+            await write;
         }
         // Another operation may have written a newer index meanwhile; keep it.
         if (this.index === index) this.clearIndex();

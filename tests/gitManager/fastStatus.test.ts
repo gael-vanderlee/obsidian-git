@@ -611,3 +611,72 @@ describe("IsomorphicGit hidden tracking robustness", () => {
         expect(manager.hiddenFiles.installed).toBe(false);
     });
 });
+
+describe("IsomorphicGit second review fixes", () => {
+    it("commits a case-only rename on case-insensitive storage", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        write(repo, "Note.md", "note\n");
+        await repo.git.add(".");
+        await repo.git.commit("note");
+        const { manager, plugin } = createIsomorphicGitManager(repo.repoPath);
+        const adapter = plugin.app.vault.adapter;
+        // Emulate a case-insensitive file system for single-path lookups.
+        const stat = adapter.stat.bind(adapter);
+        const exists = adapter.exists.bind(adapter);
+        const sameCase = (p: string) =>
+            p.toLowerCase() === "note.md" ? "note.md" : p;
+        adapter.stat = (p: string) => stat(sameCase(p));
+        adapter.exists = (p: string) => exists(sameCase(p));
+        rmSync(path.join(repo.repoPath, "Note.md"));
+        write(repo, "note.md", "note\n");
+
+        await manager.commitAll({
+            message: "rename",
+            status: await manager.status(),
+        });
+
+        expect((await repo.raw(["ls-files"])).split("\n")).not.toContain(
+            "Note.md"
+        );
+        expect(await repo.raw(["ls-files"])).toContain("note.md");
+    });
+
+    it("re-wraps when a plugin that wrapped first restores the original", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        write(repo, ".obsidian/app.json", "{}\n");
+        await repo.git.add(".");
+        await repo.git.commit("hidden");
+        await new Promise((resolve) => setTimeout(resolve, 2100));
+        const { manager, plugin } = createIsomorphicGitManager(repo.repoPath);
+        const adapter = plugin.app.vault.adapter as unknown as Record<
+            string,
+            (...args: unknown[]) => Promise<void>
+        >;
+        const real = adapter.write!;
+        // Another plugin wraps first; we wrap on top of it.
+        adapter.write = (...args: unknown[]) => real(...args);
+        await manager.status();
+        // It later restores the real method, dropping our wrapper with it.
+        adapter.write = real;
+
+        await adapter.write(".obsidian/app.json", '{"x":1}\n');
+
+        expect(normalize(await manager.status()).changed).toEqual([
+            " M .obsidian/app.json",
+        ]);
+    });
+
+    it("stages a resolved note whose heading underline is =======", async () => {
+        const repo = withCleanup(await createRepoWithMergeConflict());
+        const { manager } = createIsomorphicGitManager(repo.repoPath);
+        write(repo, "note.md", "Title\n=======\n\nresolved\n");
+
+        await manager.commitAll({
+            message: "resolve",
+            status: await manager.status(),
+        });
+
+        expect(await manager.isMergeInProgress()).toBe(false);
+        expect(await repo.show("HEAD:note.md")).toContain("resolved");
+    });
+});

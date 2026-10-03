@@ -565,6 +565,8 @@ export default class ObsidianGit extends Plugin {
         }
 
         try {
+            // Re-initialising (e.g. after creating a repo) replaces the manager.
+            (this.gitManager as GitManager | undefined)?.unload();
             if (this.useSimpleGit) {
                 this.gitManager = new SimpleGit(this);
                 await (this.gitManager as SimpleGit).setGitInstance();

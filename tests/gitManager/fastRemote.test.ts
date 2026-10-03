@@ -163,10 +163,15 @@ describe("IsomorphicGit fast push", () => {
         );
         expect(parents).toContain(theirs);
 
+        const libraryPush = vi.spyOn(
+            (await import("isomorphic-git")).default,
+            "push"
+        );
         server.requests.length = 0;
         await expect(manager.push()).resolves.toMatchObject({
             status: "pushed",
         });
+        expect(libraryPush).not.toHaveBeenCalled();
         expect(receivePackOnly(server.requests)).toBe(true);
         expect(await remoteHead(repo)).toBe(await repo.head());
         await fsckRemote(repo);

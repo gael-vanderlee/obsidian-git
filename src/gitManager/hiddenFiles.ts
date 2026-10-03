@@ -46,6 +46,9 @@ export class HiddenFileTracker {
     private wrapped: { name: string; original: unknown; wrapper: unknown }[] =
         [];
     private disposed = false;
+    private active = true;
+    // getFiles calls run one after another so each sees the others' updates.
+    private pending: Promise<unknown> = Promise.resolve();
 
     constructor(
         private readonly adapter: DataAdapter,
@@ -60,43 +63,18 @@ export class HiddenFileTracker {
 
     install(): void {
         if (this.installed || this.disposed) return;
-        const adapter = this.adapter as unknown as Record<string, unknown>;
-        let active = true;
-        for (const [name, pathArgs] of Object.entries(MUTATORS)) {
-            const original = adapter[name];
-            if (typeof original !== "function") continue;
-            const record = (args: unknown[]) => {
-                if (!active) return;
-                for (const index of pathArgs) {
-                    const path = args[index];
-                    if (typeof path === "string") this.recordChange(name, path);
-                }
-            };
-            const wrapper = function (this: unknown, ...args: unknown[]) {
-                record(args);
-                const result = (original as (...a: unknown[]) => unknown).apply(
-                    this,
-                    args
-                );
-                // Record again once done: a status that ran in between may have
-                // seen the old state and consumed the first record.
-                if (result instanceof Promise) {
-                    result.then(
-                        () => record(args),
-                        () => record(args)
-                    );
-                }
-                return result;
-            };
-            adapter[name] = wrapper;
-            this.wrapped.push({ name, original, wrapper });
-            this.cleanups.push(() => {
-                // Leave another plugin's later wrapper in place; ours goes inert.
-                if (adapter[name] === wrapper) adapter[name] = original;
-            });
-        }
+        this.active = true;
+        for (const name of Object.keys(MUTATORS)) this.wrap(name);
         this.cleanups.push(() => {
-            active = false;
+            // Unwind our wrappers, newest first; leave another plugin's later
+            // wrapper in place (ours then just goes inert).
+            const adapter = this.adapter as unknown as Record<string, unknown>;
+            for (const entry of [...this.wrapped].reverse()) {
+                if (adapter[entry.name] === entry.wrapper) {
+                    adapter[entry.name] = entry.original;
+                }
+            }
+            this.active = false;
         });
 
         const onVisibility = () => {
@@ -113,6 +91,38 @@ export class HiddenFileTracker {
             SAFETY_SCAN_INTERVAL_MS
         );
         this.cleanups.push(() => window.clearInterval(interval));
+    }
+
+    private wrap(name: string): void {
+        const adapter = this.adapter as unknown as Record<string, unknown>;
+        const original = adapter[name];
+        const pathArgs = MUTATORS[name];
+        if (typeof original !== "function" || !pathArgs) return;
+        const record = (args: unknown[]) => {
+            if (!this.active) return;
+            for (const index of pathArgs) {
+                const path = args[index];
+                if (typeof path === "string") this.recordChange(name, path);
+            }
+        };
+        const wrapper = function (this: unknown, ...args: unknown[]) {
+            record(args);
+            const result = (original as (...a: unknown[]) => unknown).apply(
+                this,
+                args
+            );
+            // Record again once done: a status that ran in between may have
+            // seen the old state and consumed the first record.
+            if (result instanceof Promise) {
+                result.then(
+                    () => record(args),
+                    () => record(args)
+                );
+            }
+            return result;
+        };
+        adapter[name] = wrapper;
+        this.wrapped.push({ name, original, wrapper });
     }
 
     /** Installs tracking and runs the first full scan in the background shortly after. */
@@ -163,14 +173,22 @@ export class HiddenFileTracker {
         }
     }
 
-    /** Re-wraps methods whose original was put back by someone else. */
+    /**
+     * Wraps again any method whose current value is not our latest wrapper:
+     * whoever replaced it may no longer call us. Wrapping twice only records
+     * twice, which is harmless.
+     */
     private ensureWrapped(): void {
+        if (!this.installed) return;
         const adapter = this.adapter as unknown as Record<string, unknown>;
-        for (const entry of this.wrapped) {
-            if (adapter[entry.name] === entry.original) {
-                adapter[entry.name] = entry.wrapper;
+        for (const name of Object.keys(MUTATORS)) {
+            const latest = [...this.wrapped]
+                .reverse()
+                .find((entry) => entry.name === name);
+            if (latest && adapter[name] !== latest.wrapper) {
+                this.wrap(name);
                 this.needsFullScan = true;
-                this.log(`Re-installed hidden file tracking for ${entry.name}`);
+                this.log(`Re-installed hidden file tracking for ${name}`);
             }
         }
     }
@@ -215,7 +233,13 @@ export class HiddenFileTracker {
     }
 
     /** Current stats of all hidden files, by vault path. */
-    async getFiles(): Promise<Map<string, HiddenFileStats>> {
+    getFiles(): Promise<Map<string, HiddenFileStats>> {
+        const result = this.pending.then(() => this.updateFiles());
+        this.pending = result.catch(() => undefined);
+        return result;
+    }
+
+    private async updateFiles(): Promise<Map<string, HiddenFileStats>> {
         this.ensureWrapped();
         if (this.scanning) await this.scanning;
         if (!this.snapshot || this.needsFullScan) await this.fullScan();

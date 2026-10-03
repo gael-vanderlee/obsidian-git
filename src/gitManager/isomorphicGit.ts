@@ -453,6 +453,52 @@ export class IsomorphicGit extends GitManager {
         }
     }
 
+    /**
+     * Checks whether files exist with exactly this case, by listing their
+     * folders: a single-path stat matches any case on case-insensitive storage,
+     * which would hide case-only renames. Listings are shared between calls.
+     */
+    private exactPathChecker(): (vaultPath: string) => Promise<boolean> {
+        const listings = new Map<
+            string,
+            Promise<{ files: Set<string>; folders: Set<string> } | undefined>
+        >();
+        const list = (folder: string) => {
+            let listing = listings.get(folder);
+            if (!listing) {
+                listing = this.app.vault.adapter
+                    .list(folder === "" ? "/" : folder)
+                    .then(
+                        (result) => ({
+                            files: new Set(
+                                result.files.map((p) => normalizePath(p))
+                            ),
+                            folders: new Set(
+                                result.folders.map((p) => normalizePath(p))
+                            ),
+                        }),
+                        () => undefined
+                    );
+                listings.set(folder, listing);
+            }
+            return listing;
+        };
+        const parentOf = (path: string) =>
+            path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+        const folderExists = async (folder: string): Promise<boolean> => {
+            if (folder === "") return true;
+            const parent = parentOf(folder);
+            if (!(await folderExists(parent))) return false;
+            return (await list(parent))?.folders.has(folder) ?? false;
+        };
+        return async (vaultPath) => {
+            const path = normalizePath(vaultPath);
+            const parent = parentOf(path);
+            if (!(await folderExists(parent))) return false;
+            return (await list(parent))?.files.has(path) ?? false;
+        };
+    }
+
     /** Conflicted files that were resolved: deleted, or free of conflict markers. */
     private async getResolvedConflicts(
         conflicted: string[]
@@ -470,7 +516,9 @@ export class IsomorphicGit extends GitManager {
             // Binary files can't be checked for markers; leave them to the user.
             if (content.includes(0)) continue;
             const text = new TextDecoder().decode(content);
-            if (!/^(<{7}|>{7})( |$)|^={7}$/m.test(text)) {
+            // "=======" alone is also a Markdown heading underline, so only the
+            // opening and closing markers count.
+            if (!/^(<{7}|>{7})( |$)/m.test(text)) {
                 resolved.push({ path, deleted: false });
             }
         }
@@ -482,22 +530,20 @@ export class IsomorphicGit extends GitManager {
     ): Promise<void> {
         // Never stage the deletion of a file that is still there: the status may
         // have come from a stale snapshot. Skip it and rescan instead.
-        const files: { path: string; deleted: boolean }[] = [];
-        for (const file of candidates) {
-            if (file.deleted) {
-                const stat = await this.app.vault.adapter.stat(
-                    this.getRelativeVaultPath(file.path)
-                );
-                if (stat?.type === "file") {
-                    this.plugin.log(
-                        `Not staging deletion of existing ${file.path}`
-                    );
-                    this.hiddenFiles.invalidate();
-                    continue;
-                }
-            }
-            files.push(file);
-        }
+        const exists = this.exactPathChecker();
+        const stillThere = await Promise.all(
+            candidates.map((file) =>
+                file.deleted
+                    ? exists(this.getRelativeVaultPath(file.path))
+                    : Promise.resolve(false)
+            )
+        );
+        const files = candidates.filter((file, i) => {
+            if (!stillThere[i]) return true;
+            this.plugin.log(`Not staging deletion of existing ${file.path}`);
+            this.hiddenFiles.invalidate();
+            return false;
+        });
         const results = await this.wrapFS(
             Promise.allSettled(
                 files.map((file) =>
@@ -1530,20 +1576,69 @@ export class IsomorphicGit extends GitManager {
         head: string,
         stop: string
     ): Promise<{ oid: string; parents: string[] }[] | undefined> {
+        // Usually the new commits sit directly on the remote tip. After a merge
+        // pull, one side leads to older remote commits: stop at those too.
+        return (
+            (await this.walkNewCommits(head, new Set([stop]))) ??
+            (await this.walkNewCommits(
+                head,
+                await this.recentAncestors(stop, 30)
+            ))
+        );
+    }
+
+    private async walkNewCommits(
+        head: string,
+        known: Set<string>
+    ): Promise<{ oid: string; parents: string[] }[] | undefined> {
         const result: { oid: string; parents: string[] }[] = [];
         const queue = [head];
         const seen = new Set<string>();
-        while (queue.length > 0) {
-            const oid = queue.shift()!;
-            if (oid === stop || seen.has(oid)) continue;
-            seen.add(oid);
-            if (seen.size > 50) return undefined;
-            const { commit } = await git.readCommit({ ...this.getRepo(), oid });
-            if (commit.parent.length === 0) return undefined;
-            result.push({ oid, parents: commit.parent });
-            queue.push(...commit.parent);
+        try {
+            while (queue.length > 0) {
+                const oid = queue.shift()!;
+                if (known.has(oid) || seen.has(oid)) continue;
+                seen.add(oid);
+                if (seen.size > 50) return undefined;
+                const { commit } = await git.readCommit({
+                    ...this.getRepo(),
+                    oid,
+                });
+                if (commit.parent.length === 0) return undefined;
+                result.push({ oid, parents: commit.parent });
+                queue.push(...commit.parent);
+            }
+        } catch {
+            // A parent missing from a shallow clone: not a short, complete chain.
+            return undefined;
         }
         return result;
+    }
+
+    /** The commit and up to `limit` of its ancestors that are available locally. */
+    private async recentAncestors(
+        oid: string,
+        limit: number
+    ): Promise<Set<string>> {
+        const known = new Set([oid]);
+        const queue = [oid];
+        while (queue.length > 0 && known.size < limit) {
+            try {
+                const { commit } = await git.readCommit({
+                    ...this.getRepo(),
+                    oid: queue.shift()!,
+                });
+                for (const parent of commit.parent) {
+                    if (!known.has(parent)) {
+                        known.add(parent);
+                        queue.push(parent);
+                    }
+                }
+            } catch {
+                // Shallow boundary.
+            }
+        }
+        return known;
     }
 
     /**

@@ -30,6 +30,7 @@ import { GitConflictError, GitOperation, type DiffFile } from "../types";
 import { GeneralModal } from "../ui/modals/generalModal";
 import { splitRemoteBranch, worthWalking } from "../utils";
 import { GitManager } from "./gitManager";
+import { HiddenFileTracker, type HiddenFileStats } from "./hiddenFiles";
 import { MyAdapter } from "./myAdapter";
 import {
     advertiseReceivePack,
@@ -70,6 +71,14 @@ export class IsomorphicGit extends GitManager {
     private readonly fs = new MyAdapter(this.app.vault, this.plugin);
     /** Use the index and Obsidian's file cache for status instead of a full walk. */
     useFastStatus = true;
+    readonly hiddenFiles = new HiddenFileTracker(
+        this.app.vault.adapter,
+        () => this.scanHiddenFiles(),
+        (path) =>
+            path === this.getGitDirPath() ||
+            path.startsWith(`${this.getGitDirPath()}/`),
+        (...data) => this.plugin.log(...data)
+    );
     // Blob oids of the HEAD tree by path, cached per HEAD commit.
     private headTree?: HeadSnapshot;
     // isIgnored results, valid while the .gitignore files are unchanged.
@@ -791,9 +800,13 @@ export class IsomorphicGit extends GitManager {
                         let workOid: string | undefined;
                         if (stats) {
                             const mtime = Math.floor(stats.mtimeMs / 1000);
+                            // Compare mtime to the millisecond: an edit that keeps
+                            // the size within the same second must not look clean.
                             if (
                                 entry &&
-                                entry.mtimeSeconds === mtime &&
+                                entry.mtimeSeconds * 1000 +
+                                    Math.floor(entry.mtimeNanoseconds / 1e6) ===
+                                    Math.floor(stats.mtimeMs) &&
                                 entry.ctimeSeconds ===
                                     Math.floor(stats.ctimeMs / 1000) &&
                                 entry.size === stats.size &&
@@ -867,35 +880,39 @@ export class IsomorphicGit extends GitManager {
     private async listWorkingTree(): Promise<Map<string, WorkingFileStats>> {
         const base = this.plugin.settings.basePath;
         const prefix = base ? `${base}/` : "";
-        const toRepoPath = (vaultPath: string) =>
-            vaultPath.slice(prefix.length);
-        const inRepo = (vaultPath: string) =>
-            prefix === "" || vaultPath.startsWith(prefix);
         const files = new Map<string, WorkingFileStats>();
         for (const file of this.app.vault.getFiles()) {
-            if (!inRepo(file.path)) continue;
-            files.set(toRepoPath(file.path), {
+            if (!file.path.startsWith(prefix)) continue;
+            files.set(file.path.slice(prefix.length), {
                 ctimeMs: file.stat.ctime,
                 mtimeMs: file.stat.mtime,
                 size: file.stat.size,
             });
         }
+        this.hiddenFiles.install();
+        for (const [path, stats] of await this.hiddenFiles.getFiles()) {
+            if (path.startsWith(prefix))
+                files.set(path.slice(prefix.length), stats);
+        }
+        return files;
+    }
 
-        // Obsidian does not index dot-files and dot-folders. Find them by
-        // listing every folder it knows, then everything below hidden ones.
+    /**
+     * Stats of all files Obsidian does not index (dot-files and everything in
+     * dot-folders), by vault path: lists every folder Obsidian knows, then
+     * everything below hidden ones.
+     */
+    private async scanHiddenFiles(): Promise<Map<string, HiddenFileStats>> {
         const gitDir = this.getGitDirPath();
-        const folders = this.app.vault
+        const base = this.plugin.settings.basePath;
+        // Stay inside the repository when it is a vault subfolder.
+        const inRepo = (folder: string) =>
+            !base ? true : folder === base || folder.startsWith(`${base}/`);
+        const files = new Map<string, HiddenFileStats>();
+        const queue = this.app.vault
             .getAllLoadedFiles()
-            .filter((file) => "children" in file)
-            .map((folder) => folder.path)
-            .filter((folder) =>
-                folder === "/"
-                    ? prefix === ""
-                    : inRepo(`${folder}/`) || folder === base
-            );
-        const queue: { folder: string; hidden: boolean }[] = folders.map(
-            (folder) => ({ folder, hidden: false })
-        );
+            .filter((file) => "children" in file && inRepo(file.path))
+            .map((folder) => ({ folder: folder.path, hidden: false }));
         const isHiddenName = (vaultPath: string) =>
             vaultPath.split("/").pop()!.startsWith(".");
         await runLimited(queue, 16, async ({ folder, hidden }) => {
@@ -906,20 +923,19 @@ export class IsomorphicGit extends GitManager {
                     queue.push({ folder: child, hidden: true });
                 }
             }
-            const statTargets = listing.files.filter(
-                (child) => hidden || isHiddenName(child)
-            );
             await Promise.all(
-                statTargets.map(async (child) => {
-                    const stat = await this.app.vault.adapter.stat(child);
-                    if (stat?.type === "file" && inRepo(child)) {
-                        files.set(toRepoPath(child), {
-                            ctimeMs: stat.ctime,
-                            mtimeMs: stat.mtime,
-                            size: stat.size,
-                        });
-                    }
-                })
+                listing.files
+                    .filter((child) => hidden || isHiddenName(child))
+                    .map(async (child) => {
+                        const stat = await this.app.vault.adapter.stat(child);
+                        if (stat?.type === "file") {
+                            files.set(child, {
+                                ctimeMs: stat.ctime,
+                                mtimeMs: stat.mtime,
+                                size: stat.size,
+                            });
+                        }
+                    })
             );
         });
         return files;
@@ -1089,6 +1105,11 @@ export class IsomorphicGit extends GitManager {
             }
             return ignored;
         };
+    }
+
+    override unload(): void {
+        this.hiddenFiles.uninstall();
+        super.unload();
     }
 
     private getInfoCache(): NonNullable<IsomorphicGit["infoCache"]> {
@@ -1359,6 +1380,10 @@ export class IsomorphicGit extends GitManager {
             normalizePath(`${this.getGitDirPath()}/HEAD`)
         );
 
+        if (headExists && this.useFastStatus && !this.plugin.settings.gitDir) {
+            // Have the hidden file snapshot ready before the first commit.
+            this.hiddenFiles.start(2000);
+        }
         return headExists ? "valid" : "missing-repo";
     }
 
@@ -2364,6 +2389,7 @@ type GitIndexLike = {
             oid: string;
             mode: number;
             mtimeSeconds: number;
+            mtimeNanoseconds: number;
             ctimeSeconds: number;
             size: number;
         }

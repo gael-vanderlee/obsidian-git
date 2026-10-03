@@ -1,5 +1,13 @@
 import { readdirSync, statSync } from "fs";
-import { mkdir, readFile, readdir, rm, stat, writeFile } from "fs/promises";
+import {
+    mkdir,
+    readFile,
+    readdir,
+    rename,
+    rm,
+    stat,
+    writeFile,
+} from "fs/promises";
 import path from "path";
 import { vi } from "vitest";
 import { IsomorphicGit } from "../../src/gitManager/isomorphicGit";
@@ -73,6 +81,10 @@ function createNodeVault(root: string) {
             mkdir(resolve(vaultPath), { recursive: true }),
         rmdir: (vaultPath: string, recursive = false) =>
             rm(resolve(vaultPath), { recursive, force: true }),
+        rename: async (from: string, to: string) => {
+            await mkdir(path.dirname(resolve(to)), { recursive: true });
+            await rename(resolve(from), resolve(to));
+        },
         remove: (vaultPath: string) =>
             rm(resolve(vaultPath), { recursive: true, force: true }),
     };

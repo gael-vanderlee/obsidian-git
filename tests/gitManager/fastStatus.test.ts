@@ -64,75 +64,109 @@ const PATHS = [
 ];
 
 describe("IsomorphicGit fast status", () => {
-    it("matches statusMatrix across random changes", async () => {
-        for (let seed = 1; seed <= 12; seed++) {
-            const rand = random(seed);
-            const pick = <T>(items: T[]) =>
-                items[Math.floor(rand() * items.length)]!;
-            const repo = withCleanup(await createRepoWithOrigin());
-            const { manager } = createIsomorphicGitManager(repo.repoPath);
-            write(repo, ".gitignore", "*.log\n.trash/\n");
-            await repo.git.add(".");
-            await repo.git.commit("ignore");
-            const sizes = new Map<string, number>();
+    it.each([
+        ["external changes with a full scan before each status", "external"],
+        [
+            "changes made through Obsidian's adapter, without full scans",
+            "adapter",
+        ],
+    ] as const)(
+        "matches statusMatrix across random %s",
+        async (_name, mode) => {
+            for (let seed = 1; seed <= 12; seed++) {
+                const rand = random(seed);
+                const pick = <T>(items: T[]) =>
+                    items[Math.floor(rand() * items.length)]!;
+                const repo = withCleanup(await createRepoWithOrigin());
+                const { manager, plugin } = createIsomorphicGitManager(
+                    repo.repoPath
+                );
+                const adapter = plugin.app.vault.adapter;
+                const isHidden = (file: string) =>
+                    file.split("/").some((part) => part.startsWith("."));
+                write(repo, ".gitignore", "*.log\n.trash/\n");
+                await repo.git.add(".");
+                await repo.git.commit("ignore");
+                const sizes = new Map<string, number>();
 
-            for (let step = 0; step < 14; step++) {
-                const file = pick(PATHS);
-                const action = pick([
-                    "write",
-                    "write",
-                    "write",
-                    "delete",
-                    "stage",
-                    "stageAll",
-                    "commit",
-                    "unstage",
-                ]);
-                const full = path.join(repo.repoPath, file);
-                if (action === "write") {
-                    // Grow the file so same-second rewrites change the size.
-                    const size = (sizes.get(file) ?? 0) + 1 + step;
-                    sizes.set(file, size);
-                    write(repo, file, "x".repeat(size) + "\n");
-                } else if (action === "delete") {
-                    rmSync(full, { force: true });
-                } else if (action === "stage") {
-                    await repo.git
-                        .raw(["add", "-A", "--", file])
-                        .catch(() => {});
-                } else if (action === "stageAll") {
-                    await repo.git.add(["-A"]);
-                } else if (action === "commit") {
-                    await repo.git.add(["-A"]);
-                    await repo.git
-                        .commit(`step ${step}`, ["--allow-empty"])
-                        .catch(() => {});
-                } else {
-                    await repo.git
-                        .raw(["reset", "-q", "--", file])
-                        .catch(() => {});
+                for (let step = 0; step < 14; step++) {
+                    const file = pick(PATHS);
+                    const action = pick([
+                        "write",
+                        "write",
+                        "write",
+                        "delete",
+                        "stage",
+                        "stageAll",
+                        "commit",
+                        "unstage",
+                    ]);
+                    const full = path.join(repo.repoPath, file);
+                    if (action === "write") {
+                        // Grow the file so same-second rewrites change the size.
+                        const size = (sizes.get(file) ?? 0) + 1 + step;
+                        sizes.set(file, size);
+                        const content = "x".repeat(size) + "\n";
+                        if (mode === "adapter" && isHidden(file)) {
+                            await adapter.write(file, content);
+                        } else {
+                            write(repo, file, content);
+                        }
+                    } else if (action === "delete") {
+                        if (mode === "adapter" && isHidden(file)) {
+                            await adapter.remove(file);
+                        } else {
+                            rmSync(full, { force: true });
+                        }
+                    } else if (action === "stage") {
+                        await repo.git
+                            .raw(["add", "-A", "--", file])
+                            .catch(() => {});
+                    } else if (action === "stageAll") {
+                        await repo.git.add(["-A"]);
+                    } else if (action === "commit") {
+                        await repo.git.add(["-A"]);
+                        await repo.git
+                            .commit(`step ${step}`, ["--allow-empty"])
+                            .catch(() => {});
+                    } else {
+                        await repo.git
+                            .raw(["reset", "-q", "--", file])
+                            .catch(() => {});
+                    }
+                    if (mode === "external") manager.hiddenFiles.invalidate();
+                    const { reference, fast } = await statusBoth(manager);
+                    expect(
+                        fast,
+                        `seed ${seed} step ${step} ${action} ${file}`
+                    ).toEqual(reference);
                 }
-                const { reference, fast } = await statusBoth(manager);
-                expect(
-                    fast,
-                    `seed ${seed} step ${step} ${action} ${file}`
-                ).toEqual(reference);
             }
-        }
-    }, 120_000);
+        },
+        120_000
+    );
 
-    it("detects a same-size edit in the same second as the index write", async () => {
+    it("keeps reporting a same-size, same-second edit after the index is rewritten", async () => {
         const repo = withCleanup(await createRepoWithOrigin());
         const { manager } = createIsomorphicGitManager(repo.repoPath);
+        write(repo, "other.md", "other\n");
         write(repo, "same.md", "aaaa\n");
         await repo.git.add(".");
         await repo.git.commit("same");
         write(repo, "same.md", "bbbb\n");
+        // Touch another tracked file so the next status refreshes and rewrites the index.
+        write(repo, "other.md", "other\n");
+        // The rewrite then happens in a later second than the edit.
+        await new Promise((resolve) => setTimeout(resolve, 1100));
 
-        const status = normalize(await manager.status());
-
-        expect(status.changed).toEqual([" M same.md"]);
-        expect(await repo.statusPorcelain()).toContain("M same.md");
+        expect(normalize(await manager.status()).changed).toEqual([
+            " M same.md",
+        ]);
+        // Once the rewritten index is older than the edit's second, stats decide alone.
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+        expect(normalize(await manager.status()).changed).toEqual([
+            " M same.md",
+        ]);
     });
 
     it("reports conflicts like statusMatrix", async () => {
@@ -298,4 +332,80 @@ describe("IsomorphicGit incremental commit tree", () => {
         const withTree = commitSpy.mock.calls.filter(([args]) => args.tree);
         expect(withTree.length).toBe(commitSpy.mock.calls.length);
     }, 60_000);
+});
+
+describe("IsomorphicGit hidden file tracking", () => {
+    async function setupTracked() {
+        const repo = withCleanup(await createRepoWithOrigin());
+        write(repo, ".obsidian/plugins/p/data.json", "{}\n");
+        write(repo, ".obsidian/app.json", "{}\n");
+        await repo.git.add(".");
+        await repo.git.commit("hidden");
+        const context = createIsomorphicGitManager(repo.repoPath);
+        await context.manager.status();
+        return { repo, ...context };
+    }
+
+    it("sees adapter writes without scanning again", async () => {
+        const { manager, plugin } = await setupTracked();
+        const adapter = plugin.app.vault.adapter;
+        const list = vi.spyOn(adapter, "list");
+
+        await adapter.write(".obsidian/plugins/p/data.json", '{"a":1}\n');
+        await adapter.write(".obsidian/new.json", "{}\n");
+        await adapter.remove(".obsidian/app.json");
+        const status = normalize(await manager.status());
+
+        expect(list).not.toHaveBeenCalled();
+        expect(status.changed).toEqual([
+            " D .obsidian/app.json",
+            " M .obsidian/plugins/p/data.json",
+            "UU .obsidian/new.json",
+        ]);
+    });
+
+    it("sees external changes after a scheduled full scan", async () => {
+        const { repo, manager } = await setupTracked();
+        // Leave the same-second window, where files are always re-hashed.
+        await new Promise((resolve) => setTimeout(resolve, 1100));
+        await manager.status();
+        write(repo, ".obsidian/app.json", '{"external":true}\n');
+
+        expect(normalize(await manager.status()).changed).toEqual([]);
+
+        manager.hiddenFiles.scheduleFullScan();
+        expect(normalize(await manager.status()).changed).toEqual([
+            " M .obsidian/app.json",
+        ]);
+    });
+
+    it("rescans when a hidden folder is renamed through the adapter", async () => {
+        const { manager, plugin } = await setupTracked();
+
+        await plugin.app.vault.adapter.rename(
+            ".obsidian/plugins/p",
+            ".obsidian/plugins/q"
+        );
+        const status = normalize(await manager.status());
+
+        expect(status.changed).toEqual([
+            " D .obsidian/plugins/p/data.json",
+            "UU .obsidian/plugins/q/data.json",
+        ]);
+    });
+
+    it("restores the adapter on unload", async () => {
+        const { manager, plugin } = await setupTracked();
+        const adapter = plugin.app.vault.adapter as unknown as Record<
+            string,
+            unknown
+        >;
+        expect(manager.hiddenFiles.installed).toBe(true);
+        const wrapped = adapter.write;
+
+        manager.unload();
+
+        expect(manager.hiddenFiles.installed).toBe(false);
+        expect(adapter.write).not.toBe(wrapped);
+    });
 });

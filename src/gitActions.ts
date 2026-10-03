@@ -447,21 +447,14 @@ export class GitActions {
             this.plugin.settings.pullBeforePush
         ) {
             // A push the remote accepts proves there was nothing to pull.
-            if (
-                !this.plugin.settings.disablePush &&
-                (await this.isPushRemoteSet()) &&
-                (await this.plugin.gitManager.canPush())
-            ) {
-                const pushed =
-                    await this.plugin.gitManager.pushIfRemoteUnchanged();
-                if (pushed) {
-                    this.plugin.setPluginState({ offlineMode: false });
-                    this.plugin.app.workspace.trigger("obsidian-git:refresh");
-                    this.reportPushResult(pushed);
-                    return pushed.status === "pushed"
-                        ? { status: "synced", commit: commitResult }
-                        : { status: "nothing-to-push", commit: commitResult };
-                }
+            const pushed = await this.tryPushIfRemoteUnchanged();
+            if (pushed) {
+                this.plugin.setPluginState({ offlineMode: false });
+                this.plugin.app.workspace.trigger("obsidian-git:refresh");
+                this.reportPushResult(pushed);
+                return pushed.status === "pushed"
+                    ? { status: "synced", commit: commitResult }
+                    : { status: "nothing-to-push", commit: commitResult };
             }
             this.reportPullResult(await this.performPull());
         }
@@ -484,8 +477,12 @@ export class GitActions {
 
         // Prevent trying to push every time. Only if unpushed commits are present
         if (await this.plugin.gitManager.canPush()) {
-            // A conflicting pull throws before this point, so skip the status refresh.
-            const pushResult = await this.performPush({ refreshStatus: false });
+            // A conflicting pull throws before this point, so skip the status
+            // refresh. Desktop keeps it: a rebase whose autostash fails to
+            // apply exits successfully and is only visible in the status.
+            const pushResult = await this.performPush({
+                refreshStatus: this.plugin.gitManager instanceof SimpleGit,
+            });
             this.reportPushResult(pushResult);
             switch (pushResult.status) {
                 case "pushed":
@@ -507,6 +504,28 @@ export class GitActions {
 
         this.reportPushResult({ status: "up-to-date" });
         return { status: "nothing-to-push", commit: commitResult };
+    }
+
+    /**
+     * Backends that support it push without checking the remote first. Never
+     * prompts and never fails the sync: any problem means "sync normally".
+     */
+    private async tryPushIfRemoteUnchanged(): Promise<PushResult | undefined> {
+        const gitManager = this.plugin.gitManager;
+        if (
+            this.plugin.settings.disablePush ||
+            !gitManager.supportsPushIfRemoteUnchanged
+        ) {
+            return undefined;
+        }
+        try {
+            if (!(await gitManager.branchInfo()).tracking) return undefined;
+            if (!(await gitManager.canPush())) return undefined;
+            return await gitManager.pushIfRemoteUnchanged();
+        } catch (error) {
+            this.plugin.log("Direct push skipped", error);
+            return undefined;
+        }
     }
 
     async commit(

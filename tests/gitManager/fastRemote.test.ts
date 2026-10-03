@@ -1,3 +1,4 @@
+import { randomBytes } from "crypto";
 import { mkdirSync, rmSync, writeFileSync } from "fs";
 import path from "path";
 import { simpleGit } from "simple-git";
@@ -305,6 +306,40 @@ describe("commit-and-sync with a direct push", () => {
             (await repo.raw(["log", "-1", "--format=%P"])).split(" ")
         ).toContain(theirs);
         await fsckRemote(repo);
+    });
+
+    it("checks the remote first for large pushes and builds the pack once", async () => {
+        const { repo, server, sync } = await setupSync();
+        // Random bytes don't compress, so the pack stays over the limit.
+        const big = randomBytes(400_000).toString("base64");
+        writeFile(repo, "attachment.txt", big);
+        const isoGit = (await import("isomorphic-git")).default;
+        const packObjects = vi.spyOn(isoGit, "packObjects");
+
+        await expect(sync()).resolves.toMatchObject({
+            value: { status: "synced" },
+        });
+
+        expect(server.requests).toEqual([
+            "GET /remote.git/info/refs?service=git-receive-pack",
+            "POST /remote.git/git-receive-pack",
+        ]);
+        expect(packObjects).toHaveBeenCalledTimes(1);
+        expect(await remoteHead(repo)).toBe(await repo.head());
+        await fsckRemote(repo);
+    });
+
+    it("syncs normally when the direct push attempt throws", async () => {
+        const { repo, manager, sync } = await setupSync();
+        writeFile(repo, "note.md", "edited\n");
+        vi.spyOn(manager, "pushIfRemoteUnchanged").mockRejectedValue(
+            new Error("boom")
+        );
+
+        await expect(sync()).resolves.toMatchObject({
+            value: { status: "synced" },
+        });
+        expect(await remoteHead(repo)).toBe(await repo.head());
     });
 
     it("stops pushing directly when the server needs ref discovery", async () => {

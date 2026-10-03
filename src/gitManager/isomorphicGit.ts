@@ -110,6 +110,13 @@ export class IsomorphicGit extends GitManager {
     };
     private readonly timers: number[] = [];
     private disposed = false;
+    // A pack built for a direct push that was too big to send blindly.
+    private preparedPack?: {
+        localOid: string;
+        trackingOid: string;
+        packfile: Uint8Array;
+        changedFiles?: number;
+    };
     // Set when the server did not understand a push without ref discovery.
     private optimisticPushDisabled = false;
     // Last remote tip seen; lets push reuse the probe made by the preceding pull.
@@ -1417,6 +1424,8 @@ export class IsomorphicGit extends GitManager {
      * tracking ref. The server only accepts the update if it does, so success
      * also means there was nothing to pull. Undefined means sync normally.
      */
+    override readonly supportsPushIfRemoteUnchanged = true;
+
     override async pushIfRemoteUnchanged(): Promise<PushResult | undefined> {
         if (this.optimisticPushDisabled || this.plugin.state.mergeInProgress) {
             return undefined;
@@ -1454,13 +1463,25 @@ export class IsomorphicGit extends GitManager {
 
             const commits = await this.commitsSince(localOid, trackingOid);
             if (!commits) return undefined;
-            const { oids, changedFiles } =
-                await this.collectPushObjects(commits);
-            const { packfile } = await git.packObjects({
-                ...this.getRepo(),
-                oids: [...oids],
-            });
+            const prepared = this.preparedPack;
+            this.preparedPack = undefined;
+            const { packfile, changedFiles } =
+                prepared?.localOid === localOid &&
+                prepared.trackingOid === trackingOid
+                    ? prepared
+                    : await this.buildPushPack(commits);
             if (!packfile) return undefined;
+            if (optimistic && packfile.length > OPTIMISTIC_PUSH_MAX_BYTES) {
+                // Too big to risk uploading twice if the remote moved: check
+                // the remote first, and reuse this pack for that push.
+                this.preparedPack = {
+                    localOid,
+                    trackingOid,
+                    packfile,
+                    changedFiles,
+                };
+                return undefined;
+            }
             this.remoteTip = undefined;
             const result = await sendReceivePack({
                 url: tip.url,
@@ -1494,6 +1515,17 @@ export class IsomorphicGit extends GitManager {
             this.plugin.log("Fast push failed, using regular push", error);
             return undefined;
         }
+    }
+
+    private async buildPushPack(
+        commits: { oid: string; parents: string[] }[]
+    ): Promise<{ packfile?: Uint8Array; changedFiles?: number }> {
+        const { oids, changedFiles } = await this.collectPushObjects(commits);
+        const { packfile } = await git.packObjects({
+            ...this.getRepo(),
+            oids: [...oids],
+        });
+        return { packfile, changedFiles };
     }
 
     /** Commits reachable from `head` but not from `stop`, or undefined if that is not a short, complete chain. */
@@ -2652,6 +2684,10 @@ async function inflateIfGzipped(buffer: ArrayBuffer): Promise<ArrayBuffer> {
         return buffer;
     }
 }
+
+// Larger pushes check the remote first so a moved remote doesn't cost a
+// wasted upload.
+const OPTIMISTIC_PUSH_MAX_BYTES = 256 * 1024;
 
 type WorkingFileStats = { ctimeMs: number; mtimeMs: number; size: number };
 

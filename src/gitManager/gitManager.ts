@@ -39,6 +39,8 @@ export abstract class GitManager {
      * Pushes only if the remote still matches the tracking branch, without a
      * separate check first. Undefined means it did not push; sync normally.
      */
+    readonly supportsPushIfRemoteUnchanged: boolean = false;
+
     pushIfRemoteUnchanged(): Promise<PushResult | undefined> {
         return Promise.resolve(undefined);
     }

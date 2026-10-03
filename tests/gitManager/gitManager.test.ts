@@ -423,7 +423,7 @@ describe.each(gitManagerBackends)("$name GitManager contract", (backend) => {
         }
     });
 
-    it("does not refresh the status between pull and push in commit-and-sync", async () => {
+    it("refreshes the status between pull and push only on desktop", async () => {
         context = await backend.create();
         const { manager, plugin, repo } = context;
         repo.write("note.md", "modified\n");
@@ -444,7 +444,7 @@ describe.each(gitManagerBackends)("$name GitManager contract", (backend) => {
             events.push("pull");
             return Promise.resolve({ status: "up-to-date" });
         });
-        vi.spyOn(manager, "canPush").mockResolvedValue(true);
+        const canPush = vi.spyOn(manager, "canPush").mockResolvedValue(true);
         vi.spyOn(manager, "push").mockImplementation(() => {
             events.push("push");
             return Promise.resolve({ status: "pushed", files: 1 });
@@ -459,7 +459,16 @@ describe.each(gitManagerBackends)("$name GitManager contract", (backend) => {
             status: "success",
             value: { status: "synced" },
         });
-        expect(events.slice(events.indexOf("pull"))).toEqual(["pull", "push"]);
+        // Desktop never tries a direct push, so it checks canPush only once.
+        if (backend.name === "simple-git") {
+            expect(canPush).toHaveBeenCalledTimes(1);
+        }
+        // Desktop keeps the refresh (a failed autostash only shows there).
+        expect(events.slice(events.indexOf("pull"))).toEqual(
+            backend.name === "simple-git"
+                ? ["pull", "status", "push"]
+                : ["pull", "push"]
+        );
     });
 
     it("finishes a resolved merge when committing all through GitActions", async () => {

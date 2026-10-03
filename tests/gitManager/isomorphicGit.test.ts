@@ -248,3 +248,24 @@ describe("IsomorphicGit info cache", () => {
         expect((await manager.branchInfo()).current).toBe("main");
     });
 });
+
+describe("IsomorphicGit commit caches", () => {
+    it("sees a new commit immediately and reuses its change count", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const { manager, plugin } = createIsomorphicGitManager(repo.repoPath);
+        plugin.localStorage = {
+            getHostname: () => null,
+        } as unknown as typeof plugin.localStorage;
+        plugin.settings.commitDateFormat = "YYYY";
+        expect(await manager.canPush()).toBe(false);
+        repo.write("note.md", "changed\n");
+        await manager.stage("note.md", false);
+
+        await expect(manager.commit({ message: "m" })).resolves.toBe(1);
+
+        expect(await manager.canPush()).toBe(true);
+        const readTree = vi.spyOn(git, "readTree");
+        expect(await manager.getUnpushedCommits()).toBe(1);
+        expect(readTree).not.toHaveBeenCalled();
+    });
+});

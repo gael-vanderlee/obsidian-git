@@ -88,7 +88,15 @@ export class IsomorphicGit extends GitManager {
         expires: number;
         branchInfo?: Promise<BranchInfo & { remote: string }>;
         config: Map<string, Promise<string | undefined>>;
+        refs: Map<string, Promise<string>>;
     };
+    // File changes between two commit oids; commits never change, so no expiry.
+    private readonly changesCache = new Map<string, WalkDifference[]>();
+    private headSnapshotLoad?: {
+        commit: string;
+        promise: Promise<HeadSnapshot>;
+    };
+    private readonly timers: number[] = [];
     // Last remote tip seen; lets push reuse the probe made by the preceding pull.
     private remoteTip?: { url: string; ref: string; oid?: string; at: number };
 
@@ -337,6 +345,15 @@ export class IsomorphicGit extends GitManager {
                         tree: built?.tree,
                     })
                 );
+                if (changes && !parent) {
+                    const { commit: created } = await git.readCommit({
+                        ...this.getRepo(),
+                        oid,
+                    });
+                    if (created.parent.length === 1) {
+                        this.rememberChanges(created.parent[0]!, oid, changes);
+                    }
+                }
                 if (built && index) {
                     this.headTree = {
                         commit: oid,
@@ -558,7 +575,15 @@ export class IsomorphicGit extends GitManager {
     }
 
     resolveRef(ref: string): Promise<string> {
-        return this.wrapFS(git.resolveRef({ ...this.getRepo(), ref }));
+        if (/^[0-9a-f]{40}$/.test(ref)) return Promise.resolve(ref);
+        const cache = this.getInfoCache();
+        let oid = cache.refs.get(ref);
+        if (!oid) {
+            oid = this.wrapFS(git.resolveRef({ ...this.getRepo(), ref }));
+            cache.refs.set(ref, oid);
+            oid.catch(() => cache.refs.delete(ref));
+        }
+        return oid;
     }
 
     async pull(): Promise<PullResult> {
@@ -668,6 +693,7 @@ export class IsomorphicGit extends GitManager {
                 if (mergeRes.alreadyMerged) {
                     return { status: "up-to-date" };
                 }
+                this.warmHeadSnapshot(0);
 
                 return {
                     status: "updated",
@@ -950,7 +976,10 @@ export class IsomorphicGit extends GitManager {
     private async getHeadSnapshot(): Promise<HeadSnapshot> {
         let commit: string;
         try {
-            commit = await this.resolveRef("HEAD");
+            // Always fresh: status decides what gets committed.
+            commit = await this.wrapFS(
+                git.resolveRef({ ...this.getRepo(), ref: "HEAD" })
+            );
         } catch (error) {
             if (error instanceof Errors.NotFoundError) {
                 return {
@@ -963,6 +992,18 @@ export class IsomorphicGit extends GitManager {
             throw error;
         }
         if (this.headTree?.commit === commit) return this.headTree;
+        if (this.headSnapshotLoad?.commit !== commit) {
+            const promise = this.loadHeadSnapshot(commit);
+            this.headSnapshotLoad = { commit, promise };
+            promise.then(
+                () => (this.headSnapshotLoad = undefined),
+                () => (this.headSnapshotLoad = undefined)
+            );
+        }
+        return this.headSnapshotLoad.promise;
+    }
+
+    private async loadHeadSnapshot(commit: string): Promise<HeadSnapshot> {
         const files = new Map<string, string>();
         const modes = new Map<string, number>();
         const dirs = new Map<string, string>([
@@ -1107,14 +1148,43 @@ export class IsomorphicGit extends GitManager {
         };
     }
 
+    protected override async withGitOperation<T>(
+        operation: GitOperation,
+        fn: () => Promise<T>
+    ): Promise<T> {
+        // Operations may move refs or change config; never reuse reads across them.
+        this.invalidateInfo();
+        try {
+            return await super.withGitOperation(operation, fn);
+        } finally {
+            this.invalidateInfo();
+        }
+    }
+
+    /** Loads the HEAD snapshot in the background so a commit doesn't wait for it. */
+    private warmHeadSnapshot(delayMs: number): void {
+        this.timers.push(
+            window.setTimeout(() => {
+                this.getHeadSnapshot().catch((error) =>
+                    this.plugin.log("Preloading HEAD failed", error)
+                );
+            }, delayMs)
+        );
+    }
+
     override unload(): void {
         this.hiddenFiles.uninstall();
+        for (const timer of this.timers.splice(0)) window.clearTimeout(timer);
         super.unload();
     }
 
     private getInfoCache(): NonNullable<IsomorphicGit["infoCache"]> {
         if (!this.infoCache || Date.now() > this.infoCache.expires) {
-            this.infoCache = { expires: Date.now() + 3000, config: new Map() };
+            this.infoCache = {
+                expires: Date.now() + 3000,
+                config: new Map(),
+                refs: new Map(),
+            };
         }
         return this.infoCache;
     }
@@ -1381,8 +1451,9 @@ export class IsomorphicGit extends GitManager {
         );
 
         if (headExists && this.useFastStatus && !this.plugin.settings.gitDir) {
-            // Have the hidden file snapshot ready before the first commit.
+            // Have the hidden file and HEAD snapshots ready before the first commit.
             this.hiddenFiles.start(2000);
+            this.warmHeadSnapshot(2500);
         }
         return headExists ? "valid" : "missing-repo";
     }
@@ -1561,7 +1632,11 @@ export class IsomorphicGit extends GitManager {
                 remote: remote ?? (await this.getCurrentRemote()),
             };
 
-            await this.wrapFS(git.fetch(args));
+            try {
+                await this.wrapFS(git.fetch(args));
+            } finally {
+                this.invalidateInfo();
+            }
             progressNotice?.hide();
         } catch (error) {
             progressNotice?.hide();
@@ -1813,12 +1888,38 @@ export class IsomorphicGit extends GitManager {
         commitHash1: string,
         commitHash2: string
     ): Promise<WalkDifference[]> {
+        const [oid1, oid2] = await Promise.all(
+            [commitHash1, commitHash2].map((ref) => this.resolveRef(ref))
+        );
+        const cached = this.changesCache.get(`${oid1}..${oid2}`);
+        if (cached) return cached;
+        const reverse = this.changesCache.get(`${oid2}..${oid1}`);
+        if (reverse) {
+            const swap = { A: "D", D: "A", M: "M" } as const;
+            return reverse.map(({ path, type }) => ({
+                path,
+                type: swap[type],
+            }));
+        }
         const [tree1, tree2] = await Promise.all(
-            [commitHash1, commitHash2].map((ref) => this.getCommitTree(ref))
+            [oid1!, oid2!].map((oid) => this.getCommitTree(oid))
         );
         const changes: WalkDifference[] = [];
         await this.diffTrees(tree1, tree2, "", changes);
-        return changes.sort((a, b) => (a.path < b.path ? -1 : 1));
+        changes.sort((a, b) => (a.path < b.path ? -1 : 1));
+        this.rememberChanges(oid1!, oid2!, changes);
+        return changes;
+    }
+
+    private rememberChanges(
+        from: string,
+        to: string,
+        changes: WalkDifference[]
+    ): void {
+        if (this.changesCache.size >= 50) {
+            this.changesCache.delete(this.changesCache.keys().next().value!);
+        }
+        this.changesCache.set(`${from}..${to}`, changes);
     }
 
     private async getCommitTree(ref: string): Promise<string> {

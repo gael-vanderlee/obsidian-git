@@ -10,7 +10,11 @@ export type ReceivePackAdvertisement = {
     capabilities: Set<string>;
 };
 
-export type ReceivePackResult = { ok: true } | { ok: false; reason: string };
+export type ReceivePackResult =
+    | { ok: true }
+    // "rejected": the server refused the update (e.g. the remote moved);
+    // "protocol": the exchange itself failed or was not understood.
+    | { ok: false; kind: "rejected" | "protocol"; reason: string };
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -152,16 +156,30 @@ export async function sendReceivePack({
         throw: false,
     });
     if (response.status !== 200) {
-        return { ok: false, reason: `HTTP ${response.status}` };
+        return {
+            ok: false,
+            kind: "protocol",
+            reason: `HTTP ${response.status}`,
+        };
     }
     const lines = parsePktLines(new Uint8Array(response.arrayBuffer)).filter(
         (line): line is string => line !== null
     );
     const unpack = lines.find((line) => line.startsWith("unpack "));
     if (unpack?.trim() !== "unpack ok") {
-        return { ok: false, reason: unpack?.trim() ?? "no unpack status" };
+        return {
+            ok: false,
+            kind: "protocol",
+            reason: unpack?.trim() ?? "no unpack status",
+        };
     }
     const status = lines.find((line) => line.split(" ")[1]?.trim() === ref);
     if (status?.startsWith("ok ")) return { ok: true };
-    return { ok: false, reason: status?.trim() ?? "no ref status" };
+    return status?.startsWith("ng ")
+        ? { ok: false, kind: "rejected", reason: status.trim() }
+        : {
+              ok: false,
+              kind: "protocol",
+              reason: status?.trim() ?? "no ref status",
+          };
 }

@@ -2,6 +2,7 @@ import { mkdirSync, rmSync, writeFileSync } from "fs";
 import path from "path";
 import { simpleGit } from "simple-git";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { GitActions } from "../../src/gitActions";
 import { withCleanup } from "../helpers/cleanup";
 import {
     nodeRequestUrl,
@@ -25,7 +26,10 @@ afterEach(async () => {
 });
 
 async function setup(
-    options: { credentials?: { username: string; password: string } } = {}
+    options: {
+        credentials?: { username: string; password: string };
+        requireDiscovery?: boolean;
+    } = {}
 ) {
     const repo = withCleanup(await createRepoWithOrigin());
     server = await startGitHttpServer(repo.dir, options);
@@ -236,5 +240,93 @@ describe("IsomorphicGit fast push", () => {
         await expect(manager.push()).resolves.toEqual({
             status: "up-to-date",
         });
+    });
+});
+
+describe("commit-and-sync with a direct push", () => {
+    async function setupSync(options: { requireDiscovery?: boolean } = {}) {
+        const context = await setup(options);
+        const { plugin, manager } = context;
+        Object.assign(plugin.settings, {
+            pullBeforePush: true,
+            syncMethod: "merge",
+            disablePush: false,
+            mergeStrategy: "none",
+            commitDateFormat: "YYYY",
+        });
+        plugin.localStorage = {
+            ...plugin.localStorage,
+            getHostname: () => null,
+        } as typeof plugin.localStorage;
+        plugin.updateCachedStatus = () => manager.status();
+        plugin.isAllInitialized = vi.fn().mockResolvedValue(true);
+        plugin.tools = {
+            hasTooBigFiles: vi.fn().mockResolvedValue(false),
+        } as unknown as typeof plugin.tools;
+        plugin.displayMessage = vi.fn();
+        const sync = () =>
+            new GitActions(plugin).commitAndSync({
+                fromAutoBackup: false,
+                commitMessage: "sync",
+            });
+        return { ...context, sync };
+    }
+
+    it("pushes in a single request when the remote did not move", async () => {
+        const { repo, server, sync } = await setupSync();
+        writeFile(repo, "note.md", "edited\n");
+
+        await expect(sync()).resolves.toMatchObject({
+            status: "success",
+            value: { status: "synced" },
+        });
+
+        expect(server.requests).toEqual(["POST /remote.git/git-receive-pack"]);
+        expect(await remoteHead(repo)).toBe(await repo.head());
+        await fsckRemote(repo);
+    });
+
+    it("pulls and pushes normally when the remote moved", async () => {
+        const { repo, server, sync } = await setupSync();
+        const theirs = await pushFromElsewhere(repo, "theirs.md", "t\n");
+        writeFile(repo, "note.md", "edited\n");
+
+        await expect(sync()).resolves.toMatchObject({
+            status: "success",
+            value: { status: "synced" },
+        });
+
+        expect(server.requests[0]).toBe("POST /remote.git/git-receive-pack");
+        expect(server.requests.some((r) => r.includes("upload-pack"))).toBe(
+            true
+        );
+        expect(await remoteHead(repo)).toBe(await repo.head());
+        expect(
+            (await repo.raw(["log", "-1", "--format=%P"])).split(" ")
+        ).toContain(theirs);
+        await fsckRemote(repo);
+    });
+
+    it("stops pushing directly when the server needs ref discovery", async () => {
+        const { repo, server, sync } = await setupSync({
+            requireDiscovery: true,
+        });
+        writeFile(repo, "note.md", "first\n");
+        await expect(sync()).resolves.toMatchObject({
+            value: { status: "synced" },
+        });
+        expect(await remoteHead(repo)).toBe(await repo.head());
+
+        server.requests.length = 0;
+        writeFile(repo, "note.md", "second\n");
+        await expect(sync()).resolves.toMatchObject({
+            value: { status: "synced" },
+        });
+
+        expect(server.requests[0]).toBe(
+            "GET /remote.git/info/refs?service=git-receive-pack"
+        );
+        expect(await remoteHead(repo)).toBe(await repo.head());
+        await fsckRemote(repo);
     });
 });

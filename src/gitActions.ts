@@ -446,6 +446,23 @@ export class GitActions {
             this.plugin.settings.syncMethod != "reset" &&
             this.plugin.settings.pullBeforePush
         ) {
+            // A push the remote accepts proves there was nothing to pull.
+            if (
+                !this.plugin.settings.disablePush &&
+                (await this.isPushRemoteSet()) &&
+                (await this.plugin.gitManager.canPush())
+            ) {
+                const pushed =
+                    await this.plugin.gitManager.pushIfRemoteUnchanged();
+                if (pushed) {
+                    this.plugin.setPluginState({ offlineMode: false });
+                    this.plugin.app.workspace.trigger("obsidian-git:refresh");
+                    this.reportPushResult(pushed);
+                    return pushed.status === "pushed"
+                        ? { status: "synced", commit: commitResult }
+                        : { status: "nothing-to-push", commit: commitResult };
+                }
+            }
             this.reportPullResult(await this.performPull());
         }
 

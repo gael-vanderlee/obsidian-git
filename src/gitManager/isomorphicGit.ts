@@ -97,6 +97,8 @@ export class IsomorphicGit extends GitManager {
         promise: Promise<HeadSnapshot>;
     };
     private readonly timers: number[] = [];
+    // Set when the server did not understand a push without ref discovery.
+    private optimisticPushDisabled = false;
     // Last remote tip seen; lets push reuse the probe made by the preceding pull.
     private remoteTip?: { url: string; ref: string; oid?: string; at: number };
 
@@ -1200,16 +1202,23 @@ export class IsomorphicGit extends GitManager {
         };
     }
 
+    /** The remote's URL if this client can talk to it directly (plain http(s)). */
+    private async directRemoteUrl(remote: string): Promise<string | undefined> {
+        const url = await this.getRemoteUrl(remote);
+        if (!url || !/^https?:\/\//.test(url) || new URL(url).username) {
+            return undefined;
+        }
+        return url;
+    }
+
     /** Asks the remote for a branch tip; undefined when it can't be asked directly. */
     private async probeRemoteTip(
         remote: string,
         ref: string,
         maxAgeMs = 0
     ): Promise<{ url: string; oid?: string } | undefined> {
-        const url = await this.getRemoteUrl(remote);
-        if (!url || !/^https?:\/\//.test(url) || new URL(url).username) {
-            return undefined;
-        }
+        const url = await this.directRemoteUrl(remote);
+        if (!url) return undefined;
         const cached = this.remoteTip;
         if (
             cached?.url === url &&
@@ -1263,10 +1272,29 @@ export class IsomorphicGit extends GitManager {
     }
 
     /** Pushes the new objects directly; undefined means use the regular push. */
+    /**
+     * Pushes without asking the remote first, assuming it still matches the
+     * tracking ref. The server only accepts the update if it does, so success
+     * also means there was nothing to pull. Undefined means sync normally.
+     */
+    override async pushIfRemoteUnchanged(): Promise<PushResult | undefined> {
+        if (this.optimisticPushDisabled || this.plugin.state.mergeInProgress) {
+            return undefined;
+        }
+        return this.withGitOperation(GitOperation.push, async () => {
+            const { current, tracking, remote } = await this.branchInfo();
+            if (!current || !tracking) return undefined;
+            return this.tryFastPush(current, tracking, remote, {
+                optimistic: true,
+            });
+        });
+    }
+
     private async tryFastPush(
         currentBranch: string,
         tracking: string,
-        remote: string
+        remote: string,
+        { optimistic = false }: { optimistic?: boolean } = {}
     ): Promise<PushResult | undefined> {
         try {
             const branch = splitRemoteBranch(tracking)[1];
@@ -1274,7 +1302,11 @@ export class IsomorphicGit extends GitManager {
             const ref = `refs/heads/${branch}`;
             const localOid = await this.resolveRef(currentBranch);
             const trackingOid = await this.resolveRef(tracking);
-            const tip = await this.probeRemoteTip(remote, ref, 60_000);
+            const tip = optimistic
+                ? await this.directRemoteUrl(remote).then((url) =>
+                      url ? { url, oid: trackingOid } : undefined
+                  )
+                : await this.probeRemoteTip(remote, ref, 60_000);
             if (tip?.oid === undefined || tip.oid !== trackingOid) {
                 return undefined;
             }
@@ -1300,6 +1332,10 @@ export class IsomorphicGit extends GitManager {
             });
             if (!result.ok) {
                 this.plugin.log(`Fast push rejected: ${result.reason}`);
+                if (optimistic && result.kind === "protocol") {
+                    // This server may need the usual ref discovery first.
+                    this.optimisticPushDisabled = true;
+                }
                 return undefined;
             }
             await git.writeRef({

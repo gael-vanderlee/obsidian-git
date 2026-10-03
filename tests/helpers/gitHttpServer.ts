@@ -17,12 +17,27 @@ export type GitHttpServer = {
  */
 export async function startGitHttpServer(
     root: string,
-    options: { credentials?: { username: string; password: string } } = {}
+    options: {
+        credentials?: { username: string; password: string };
+        /** Refuse a push that was not preceded by ref discovery. */
+        requireDiscovery?: boolean;
+    } = {}
 ): Promise<GitHttpServer> {
     const requests: string[] = [];
     const server = http.createServer((req, res) => {
         const url = new URL(req.url ?? "/", "http://localhost");
+        const previous = requests[requests.length - 1];
         requests.push(`${req.method} ${url.pathname}${url.search}`);
+        if (
+            options.requireDiscovery &&
+            req.method === "POST" &&
+            url.pathname.endsWith("/git-receive-pack") &&
+            !previous?.includes("service=git-receive-pack")
+        ) {
+            res.writeHead(403);
+            res.end();
+            return;
+        }
         if (options.credentials) {
             const expected = `Basic ${Buffer.from(
                 `${options.credentials.username}:${options.credentials.password}`

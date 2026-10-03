@@ -429,12 +429,13 @@ export class IsomorphicGit extends GitManager {
         unstagedFiles?: UnstagedFile[];
     }): Promise<void> {
         if (status) {
-            await this.stageFiles(
-                status.changed.map((file) => ({
+            await this.stageFiles([
+                ...status.changed.map((file) => ({
                     path: file.path,
                     deleted: file.workingDir === "D",
-                }))
-            );
+                })),
+                ...(await this.getResolvedConflicts(status.conflicted)),
+            ]);
         } else {
             const filesToStage =
                 unstagedFiles ?? (await this.getUnstagedFiles(dir ?? "."));
@@ -445,6 +446,30 @@ export class IsomorphicGit extends GitManager {
                 }))
             );
         }
+    }
+
+    /** Conflicted files that were resolved: deleted, or free of conflict markers. */
+    private async getResolvedConflicts(
+        conflicted: string[]
+    ): Promise<{ path: string; deleted: boolean }[]> {
+        const resolved: { path: string; deleted: boolean }[] = [];
+        for (const path of conflicted) {
+            const vaultPath = this.getRelativeVaultPath(path);
+            if (!(await this.app.vault.adapter.exists(vaultPath))) {
+                resolved.push({ path, deleted: true });
+                continue;
+            }
+            const content = new Uint8Array(
+                await this.app.vault.adapter.readBinary(vaultPath)
+            );
+            // Binary files can't be checked for markers; leave them to the user.
+            if (content.includes(0)) continue;
+            const text = new TextDecoder().decode(content);
+            if (!/^(<{7}|>{7})( |$)|^={7}$/m.test(text)) {
+                resolved.push({ path, deleted: false });
+            }
+        }
+        return resolved;
     }
 
     private async stageFiles(

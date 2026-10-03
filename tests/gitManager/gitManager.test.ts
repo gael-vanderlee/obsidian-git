@@ -462,6 +462,53 @@ describe.each(gitManagerBackends)("$name GitManager contract", (backend) => {
         expect(events.slice(events.indexOf("pull"))).toEqual(["pull", "push"]);
     });
 
+    it("finishes a resolved merge when committing all through GitActions", async () => {
+        context = await backend.create(createRepoWithMergeConflict);
+        const { manager, plugin, repo } = context;
+        repo.write("note.md", "resolved\n");
+        plugin.updateCachedStatus = vi.fn(() => manager.status());
+        plugin.isAllInitialized = vi.fn().mockResolvedValue(true);
+        plugin.tools = {
+            hasTooBigFiles: vi.fn().mockResolvedValue(false),
+        } as unknown as typeof plugin.tools;
+        plugin.displayMessage = vi.fn();
+        plugin.handleConflict = vi.fn();
+        plugin.state.mergeInProgress = true;
+
+        const result = await new GitActions(plugin).commit({
+            fromAuto: false,
+            commitMessage: "resolve",
+            mode: "all",
+        });
+
+        expect(result).toMatchObject({ status: "success" });
+        expect(await repo.show("HEAD:note.md")).toBe("resolved");
+        expect(await manager.isMergeInProgress()).toBe(false);
+    });
+
+    it("does not stage a file that still has conflict markers", async (test) => {
+        // Desktop commits all with git add -A, markers included (unchanged).
+        if (backend.name !== "isomorphic-git") test.skip();
+        context = await backend.create(createRepoWithMergeConflict);
+        const { manager, plugin } = context;
+        plugin.handleConflict = vi.fn();
+        plugin.updateCachedStatus = vi.fn(() => manager.status());
+        plugin.isAllInitialized = vi.fn().mockResolvedValue(true);
+        plugin.tools = {
+            hasTooBigFiles: vi.fn().mockResolvedValue(false),
+        } as unknown as typeof plugin.tools;
+        plugin.displayMessage = vi.fn();
+        plugin.state.mergeInProgress = true;
+
+        await new GitActions(plugin).commit({
+            fromAuto: false,
+            commitMessage: "unresolved",
+            mode: "all",
+        });
+
+        expect(await manager.isMergeInProgress()).toBe(true);
+    });
+
     it("counts merge changes when committing all files", async () => {
         context = await backend.create(createRepoWithMergeConflict);
         const { manager, repo } = context;

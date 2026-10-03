@@ -498,3 +498,114 @@ describe("IsomorphicGit nested repositories", () => {
         expect(status.all).toEqual([]);
     });
 });
+
+describe("IsomorphicGit hidden tracking robustness", () => {
+    async function setupHidden() {
+        const repo = withCleanup(await createRepoWithOrigin());
+        write(repo, ".obsidian/app.json", "{}\n");
+        write(repo, "dir/.hidden/e.md", "e\n");
+        await repo.git.add(".");
+        await repo.git.commit("hidden");
+        return { repo, ...createIsomorphicGitManager(repo.repoPath) };
+    }
+
+    it("sees a deletion that was still running during a status", async () => {
+        const { manager, plugin } = await setupHidden();
+        const adapter = plugin.app.vault.adapter;
+        const remove = adapter.remove.bind(adapter);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => (release = resolve));
+        adapter.remove = async (p: string) => {
+            await gate;
+            return remove(p);
+        };
+        await manager.status();
+
+        const removing = adapter.remove(".obsidian/app.json");
+        await manager.status();
+        release();
+        await removing;
+
+        expect(normalize(await manager.status()).changed).toEqual([
+            " D .obsidian/app.json",
+        ]);
+    });
+
+    it("never stages the deletion of a file that is back on disk", async () => {
+        const { repo, manager, plugin } = await setupHidden();
+        await manager.status();
+        await plugin.app.vault.adapter.remove(".obsidian/app.json");
+        expect(normalize(await manager.status()).changed).toEqual([
+            " D .obsidian/app.json",
+        ]);
+        // Restored by another app; the snapshot still thinks it is gone.
+        write(repo, ".obsidian/app.json", "{}\n");
+
+        await manager.commitAll({
+            message: "m",
+            status: await manager.status(),
+        });
+
+        expect(await repo.raw(["ls-files"])).toContain(".obsidian/app.json");
+    });
+
+    it("rescans after trashing into .trash or moving a folder with hidden files", async () => {
+        const { manager, plugin } = await setupHidden();
+        await manager.status();
+
+        await plugin.app.vault.adapter.trashLocal("note.md");
+        await plugin.app.vault.adapter.rename("dir", "moved");
+        const status = normalize(await manager.status());
+
+        expect(status.changed).toEqual([
+            " D dir/.hidden/e.md",
+            " D note.md",
+            "UU .trash/note.md",
+            "UU moved/.hidden/e.md",
+        ]);
+    });
+
+    it("re-installs tracking when another plugin restores the original method", async () => {
+        const { manager, plugin } = await setupHidden();
+        const adapter = plugin.app.vault.adapter as unknown as Record<
+            string,
+            (...args: unknown[]) => Promise<void>
+        >;
+        const original = adapter.write!;
+        await manager.status();
+        const wrapped = adapter.write;
+        // Simulate another plugin putting back the method it saw first.
+        adapter.write = original;
+        expect(adapter.write).not.toBe(wrapped);
+
+        await adapter.write(".obsidian/app.json", '{"x":1}\n');
+
+        expect(normalize(await manager.status()).changed).toEqual([
+            " M .obsidian/app.json",
+        ]);
+    });
+
+    it("refreshes ignore rules when .git/info/exclude changes", async () => {
+        const { repo, manager } = await setupHidden();
+        write(repo, "scratch.tmp", "tmp\n");
+        expect(normalize(await manager.status()).changed).toContain(
+            "UU scratch.tmp"
+        );
+
+        write(repo, ".git/info/exclude", "*.tmp\n");
+
+        expect(normalize(await manager.status()).changed).not.toContain(
+            "UU scratch.tmp"
+        );
+    });
+
+    it("does not track again after unload", async () => {
+        const { manager } = await setupHidden();
+        await manager.status();
+        manager.unload();
+
+        await manager.status();
+
+        expect(manager.hiddenFiles.installed).toBe(false);
+    });
+});

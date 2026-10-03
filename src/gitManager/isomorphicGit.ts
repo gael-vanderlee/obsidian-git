@@ -109,6 +109,7 @@ export class IsomorphicGit extends GitManager {
         promise: Promise<HeadSnapshot>;
     };
     private readonly timers: number[] = [];
+    private disposed = false;
     // Set when the server did not understand a push without ref discovery.
     private optimisticPushDisabled = false;
     // Last remote tip seen; lets push reuse the probe made by the preceding pull.
@@ -473,8 +474,26 @@ export class IsomorphicGit extends GitManager {
     }
 
     private async stageFiles(
-        files: { path: string; deleted: boolean }[]
+        candidates: { path: string; deleted: boolean }[]
     ): Promise<void> {
+        // Never stage the deletion of a file that is still there: the status may
+        // have come from a stale snapshot. Skip it and rescan instead.
+        const files: { path: string; deleted: boolean }[] = [];
+        for (const file of candidates) {
+            if (file.deleted) {
+                const stat = await this.app.vault.adapter.stat(
+                    this.getRelativeVaultPath(file.path)
+                );
+                if (stat?.type === "file") {
+                    this.plugin.log(
+                        `Not staging deletion of existing ${file.path}`
+                    );
+                    this.hiddenFiles.invalidate();
+                    continue;
+                }
+            }
+            files.push(file);
+        }
         const results = await this.wrapFS(
             Promise.allSettled(
                 files.map((file) =>
@@ -835,7 +854,7 @@ export class IsomorphicGit extends GitManager {
                 this.getHeadTree(),
                 this.readIndexForStatus(),
             ]);
-            const isIgnored = this.getIgnoreChecker(working);
+            const isIgnored = await this.getIgnoreChecker(working);
             const gitlinks = [...index.gitlinks].map((link) => `${link}/`);
             // A file is trusted by its stats only if it was last written at least
             // two seconds before they were recorded (coarse FAT timestamps).
@@ -1239,17 +1258,22 @@ export class IsomorphicGit extends GitManager {
     }
 
     /** isIgnored with results cached until a .gitignore file changes. */
-    private getIgnoreChecker(
+    private async getIgnoreChecker(
         working: Map<string, WorkingFileStats>
-    ): (filepath: string) => Promise<boolean> {
-        const signature = [...working]
-            .filter(
-                ([file]) =>
-                    file === ".gitignore" || file.endsWith("/.gitignore")
-            )
-            .map(([file, stat]) => `${file}:${stat.mtimeMs}:${stat.size}`)
-            .sort()
-            .join("|");
+    ): Promise<(filepath: string) => Promise<boolean>> {
+        const exclude = await this.app.vault.adapter.stat(
+            normalizePath(`${this.getGitDirPath()}/info/exclude`)
+        );
+        const signature = [
+            `exclude:${exclude?.mtime ?? 0}:${exclude?.size ?? 0}`,
+            ...[...working]
+                .filter(
+                    ([file]) =>
+                        file === ".gitignore" || file.endsWith("/.gitignore")
+                )
+                .map(([file, stat]) => `${file}:${stat.mtimeMs}:${stat.size}`)
+                .sort(),
+        ].join("|");
         if (this.ignoredCache?.signature !== signature) {
             this.ignoredCache = { signature, results: new Map() };
         }
@@ -1279,6 +1303,7 @@ export class IsomorphicGit extends GitManager {
 
     /** Loads the HEAD snapshot in the background so a commit doesn't wait for it. */
     private warmHeadSnapshot(delayMs: number): void {
+        if (this.disposed) return;
         this.timers.push(
             window.setTimeout(() => {
                 this.getHeadSnapshot().catch((error) =>
@@ -1289,7 +1314,8 @@ export class IsomorphicGit extends GitManager {
     }
 
     override unload(): void {
-        this.hiddenFiles.uninstall();
+        this.disposed = true;
+        this.hiddenFiles.dispose();
         for (const timer of this.timers.splice(0)) window.clearTimeout(timer);
         super.unload();
     }

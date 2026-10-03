@@ -81,6 +81,11 @@ function createNodeVault(root: string) {
             mkdir(resolve(vaultPath), { recursive: true }),
         rmdir: (vaultPath: string, recursive = false) =>
             rm(resolve(vaultPath), { recursive, force: true }),
+        trashLocal: async (vaultPath: string) => {
+            const target = resolve(`.trash/${path.basename(vaultPath)}`);
+            await mkdir(path.dirname(target), { recursive: true });
+            await rename(resolve(vaultPath), target);
+        },
         rename: async (from: string, to: string) => {
             await mkdir(path.dirname(resolve(to)), { recursive: true });
             await rename(resolve(from), resolve(to));

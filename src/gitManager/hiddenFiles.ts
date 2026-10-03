@@ -43,6 +43,9 @@ export class HiddenFileTracker {
     private scanning?: Promise<void>;
     private rescanRequested = false;
     private cleanups: (() => void)[] = [];
+    private wrapped: { name: string; original: unknown; wrapper: unknown }[] =
+        [];
+    private disposed = false;
 
     constructor(
         private readonly adapter: DataAdapter,
@@ -56,7 +59,7 @@ export class HiddenFileTracker {
     }
 
     install(): void {
-        if (this.installed) return;
+        if (this.installed || this.disposed) return;
         const adapter = this.adapter as unknown as Record<string, unknown>;
         let active = true;
         for (const [name, pathArgs] of Object.entries(MUTATORS)) {
@@ -66,17 +69,27 @@ export class HiddenFileTracker {
                 if (!active) return;
                 for (const index of pathArgs) {
                     const path = args[index];
-                    if (typeof path === "string") this.recordChange(path);
+                    if (typeof path === "string") this.recordChange(name, path);
                 }
             };
             const wrapper = function (this: unknown, ...args: unknown[]) {
                 record(args);
-                return (original as (...a: unknown[]) => unknown).apply(
+                const result = (original as (...a: unknown[]) => unknown).apply(
                     this,
                     args
                 );
+                // Record again once done: a status that ran in between may have
+                // seen the old state and consumed the first record.
+                if (result instanceof Promise) {
+                    result.then(
+                        () => record(args),
+                        () => record(args)
+                    );
+                }
+                return result;
             };
             adapter[name] = wrapper;
+            this.wrapped.push({ name, original, wrapper });
             this.cleanups.push(() => {
                 // Leave another plugin's later wrapper in place; ours goes inert.
                 if (adapter[name] === wrapper) adapter[name] = original;
@@ -104,7 +117,7 @@ export class HiddenFileTracker {
 
     /** Installs tracking and runs the first full scan in the background shortly after. */
     start(delayMs: number): void {
-        if (this.installed) return;
+        if (this.installed || this.disposed) return;
         this.install();
         const timeout = window.setTimeout(() => {
             if (!this.snapshot && !this.scanning) this.scheduleFullScan();
@@ -112,17 +125,54 @@ export class HiddenFileTracker {
         this.cleanups.push(() => window.clearTimeout(timeout));
     }
 
+    /** Removes tracking for good; later install() calls do nothing. */
+    dispose(): void {
+        this.disposed = true;
+        this.uninstall();
+    }
+
     uninstall(): void {
         for (const cleanup of this.cleanups.splice(0)) cleanup();
+        this.wrapped = [];
         this.snapshot = undefined;
         this.needsFullScan = true;
         this.dirty.clear();
     }
 
-    private recordChange(rawPath: string): void {
+    private recordChange(method: string, rawPath: string): void {
         const path = rawPath.replace(/^\/+|\/+$/g, "");
         if (path.split("/").includes(".git")) return;
-        if (isHiddenPath(path) && !this.isExcluded(path)) this.dirty.add(path);
+        if (method === "trashLocal") {
+            // Moves into the vault's hidden .trash folder at an unknown path.
+            this.needsFullScan = true;
+        }
+        if (isHiddenPath(path)) {
+            if (!this.isExcluded(path)) this.dirty.add(path);
+        } else if (
+            method !== "write" &&
+            method !== "writeBinary" &&
+            method !== "append" &&
+            method !== "appendBinary" &&
+            method !== "process" &&
+            [...(this.snapshot?.keys() ?? [])].some((file) =>
+                file.startsWith(`${path}/`)
+            )
+        ) {
+            // A normal folder holding hidden files was moved or deleted.
+            this.needsFullScan = true;
+        }
+    }
+
+    /** Re-wraps methods whose original was put back by someone else. */
+    private ensureWrapped(): void {
+        const adapter = this.adapter as unknown as Record<string, unknown>;
+        for (const entry of this.wrapped) {
+            if (adapter[entry.name] === entry.original) {
+                adapter[entry.name] = entry.wrapper;
+                this.needsFullScan = true;
+                this.log(`Re-installed hidden file tracking for ${entry.name}`);
+            }
+        }
     }
 
     /** Marks the snapshot stale and refreshes it in the background. */
@@ -166,6 +216,7 @@ export class HiddenFileTracker {
 
     /** Current stats of all hidden files, by vault path. */
     async getFiles(): Promise<Map<string, HiddenFileStats>> {
+        this.ensureWrapped();
         if (this.scanning) await this.scanning;
         if (!this.snapshot || this.needsFullScan) await this.fullScan();
         const snapshot = this.snapshot!;

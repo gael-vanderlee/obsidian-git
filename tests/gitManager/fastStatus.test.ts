@@ -183,3 +183,60 @@ describe("IsomorphicGit fast status", () => {
         expect(fast.changed).toContain("UU .obsidian/x.json");
     });
 });
+
+describe("IsomorphicGit commit diff", () => {
+    it("matches git diff --name-status between random commits", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const { manager } = createIsomorphicGitManager(repo.repoPath);
+        const rand = random(7);
+        const pick = <T>(items: T[]) =>
+            items[Math.floor(rand() * items.length)]!;
+        const files = [
+            "a.md",
+            "d/b.md",
+            "d/e/c.md",
+            "x/y/z.md",
+            "t",
+            "t2/f.md",
+        ];
+        const commits = [await repo.head()];
+        for (let i = 0; i < 25; i++) {
+            const file = pick(files);
+            const full = path.join(repo.repoPath, file);
+            if (rand() < 0.3) {
+                rmSync(full, { recursive: true, force: true });
+            } else if (file === "t" && rand() < 0.5) {
+                // Replace a file with a folder of the same name.
+                rmSync(full, { recursive: true, force: true });
+                write(repo, "t/inner.md", `${i}\n`);
+            } else {
+                rmSync(full, { recursive: true, force: true });
+                write(repo, file, `${i}\n`);
+            }
+            await repo.git.add(["-A"]);
+            await repo.git.commit(`c${i}`, ["--allow-empty"]);
+            commits.push(await repo.head());
+        }
+        for (let i = 0; i < 30; i++) {
+            const from = pick(commits);
+            const to = pick(commits);
+            const expected = (
+                await repo.raw([
+                    "diff",
+                    "--no-renames",
+                    "--name-status",
+                    from,
+                    to,
+                ])
+            )
+                .split("\n")
+                .filter(Boolean)
+                .map((line) => line.replace("\t", " "))
+                .sort();
+            const actual = (await manager.getFileChangesCount(from, to))
+                .map((change) => `${change.type} ${change.path}`)
+                .sort();
+            expect(actual, `${from}..${to}`).toEqual(expected);
+        }
+    }, 60_000);
+});

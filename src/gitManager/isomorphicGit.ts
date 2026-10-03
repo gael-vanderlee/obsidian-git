@@ -7,6 +7,7 @@ import type {
     GitProgressEvent,
     HttpClient,
     StatusRow,
+    TreeEntry,
     Walker,
     WalkerEntry,
 } from "isomorphic-git";
@@ -73,6 +74,12 @@ export class IsomorphicGit extends GitManager {
     private headTree?: { commit: string; files: Map<string, string> };
     // isIgnored results, valid while the .gitignore files are unchanged.
     private ignoredCache?: { signature: string; results: Map<string, boolean> };
+    // Branch info and config reads, reused for a few seconds; mutators clear it.
+    private infoCache?: {
+        expires: number;
+        branchInfo?: Promise<BranchInfo & { remote: string }>;
+        config: Map<string, Promise<string | undefined>>;
+    };
     // Last remote tip seen; lets push reuse the probe made by the preceding pull.
     private remoteTip?: { url: string; ref: string; oid?: string; at: number };
 
@@ -295,6 +302,13 @@ export class IsomorphicGit extends GitManager {
                     parent = [await this.resolveRef("HEAD"), ...mergeHeads];
                 }
 
+                // The new tree is the index, so HEAD vs index is what gets committed.
+                const changes = amend
+                    ? undefined
+                    : await this.getIndexChanges();
+                const indexFiles = amend
+                    ? undefined
+                    : await this.readIndexEntries();
                 const oid = await this.wrapFS(
                     git.commit({
                         ...this.getRepo(),
@@ -303,7 +317,11 @@ export class IsomorphicGit extends GitManager {
                         parent: parent,
                     })
                 );
-                const committedFiles = await this.getCommittedFilesCount(oid);
+                if (indexFiles) {
+                    this.headTree = { commit: oid, files: indexFiles };
+                }
+                const committedFiles =
+                    changes?.length ?? (await this.getCommittedFilesCount(oid));
                 await this.clearMergeState();
                 this.plugin.setPluginState({ mergeInProgress: false });
                 return committedFiles;
@@ -939,6 +957,17 @@ export class IsomorphicGit extends GitManager {
         };
     }
 
+    private getInfoCache(): NonNullable<IsomorphicGit["infoCache"]> {
+        if (!this.infoCache || Date.now() > this.infoCache.expires) {
+            this.infoCache = { expires: Date.now() + 3000, config: new Map() };
+        }
+        return this.infoCache;
+    }
+
+    private invalidateInfo(): void {
+        this.infoCache = undefined;
+    }
+
     private getCredentials(): RemoteCredentials {
         return {
             username: this.plugin.localStorage.getUsername() ?? undefined,
@@ -1096,40 +1125,60 @@ export class IsomorphicGit extends GitManager {
         commits: { oid: string; parents: string[] }[]
     ): Promise<{ oids: Set<string>; changedFiles?: number }> {
         const oids = new Set<string>();
-        const countFiles =
-            commits.length === 1 && commits[0]!.parents.length === 1;
-        let changedFiles = 0;
+        const collect = async (
+            tree: string,
+            parentTrees: (string | undefined)[]
+        ): Promise<void> => {
+            if (parentTrees.includes(tree)) return;
+            oids.add(tree);
+            const [entries, ...parentEntries] = await Promise.all([
+                this.readTreeEntries(tree),
+                ...parentTrees.map((oid) =>
+                    oid ? this.readTreeEntries(oid) : Promise.resolve([])
+                ),
+            ]);
+            const parentMaps = parentEntries.map(
+                (list) => new Map(list.map((e) => [e.path, e]))
+            );
+            await Promise.all(
+                entries.map(async (entry) => {
+                    if (entry.type === "commit") return;
+                    const atPath = parentMaps.map((map) => map.get(entry.path));
+                    if (atPath.some((p) => p?.oid === entry.oid)) return;
+                    if (entry.type === "tree") {
+                        await collect(
+                            entry.oid,
+                            atPath.map((p) =>
+                                p?.type === "tree" ? p.oid : undefined
+                            )
+                        );
+                    } else {
+                        oids.add(entry.oid);
+                    }
+                })
+            );
+        };
         for (const commit of commits) {
             oids.add(commit.oid);
-            await git.walk({
-                ...this.getRepo(),
-                trees: [
-                    git.TREE({ ref: commit.oid }),
-                    ...commit.parents.map((ref) => git.TREE({ ref })),
-                ],
-                map: async (_filepath, [entry, ...parents]) => {
-                    if (!entry) {
-                        // Deleted: nothing to send, only count removed files.
-                        const type = await parents[0]?.type();
-                        if (type === "blob") changedFiles++;
-                        return type === "tree" && countFiles ? undefined : null;
-                    }
-                    const type = await entry.type();
-                    if (type === "commit") return null;
-                    const oid = await entry.oid();
-                    const parentOids = await Promise.all(
-                        parents.map((parent) =>
-                            parent ? parent.oid() : Promise.resolve(undefined)
-                        )
-                    );
-                    if (parentOids.includes(oid)) return null;
-                    oids.add(oid);
-                    if (type === "blob") changedFiles++;
-                    return type === "tree" ? undefined : null;
-                },
-            });
+            const [tree, ...parentTrees] = await Promise.all(
+                [commit.oid, ...commit.parents].map(
+                    async (oid) =>
+                        (await git.readCommit({ ...this.getRepo(), oid }))
+                            .commit.tree
+                )
+            );
+            await collect(tree!, parentTrees);
         }
-        return { oids, changedFiles: countFiles ? changedFiles : undefined };
+        let changedFiles: number | undefined;
+        if (commits.length === 1 && commits[0]!.parents.length === 1) {
+            changedFiles = (
+                await this.getFileChangesCount(
+                    commits[0]!.parents[0]!,
+                    commits[0]!.oid
+                )
+            ).length;
+        }
+        return { oids, changedFiles };
     }
 
     async getUnpushedCommits(): Promise<number> {
@@ -1180,6 +1229,18 @@ export class IsomorphicGit extends GitManager {
     }
 
     async branchInfo(): Promise<BranchInfo & { remote: string }> {
+        const cache = this.getInfoCache();
+        if (!cache.branchInfo) {
+            const info = this.readBranchInfo();
+            cache.branchInfo = info;
+            info.catch(() => {
+                if (cache.branchInfo === info) cache.branchInfo = undefined;
+            });
+        }
+        return cache.branchInfo;
+    }
+
+    private async readBranchInfo(): Promise<BranchInfo & { remote: string }> {
         const current = await git.currentBranch(this.getRepo());
 
         const branches = await git.listBranches(this.getRepo());
@@ -1213,26 +1274,40 @@ export class IsomorphicGit extends GitManager {
     }
 
     async checkout(branch: string, remote?: string): Promise<void> {
-        return this.withGitOperation(GitOperation.checkout, () =>
-            this.wrapFS(
-                git.checkout({
-                    ...this.getRepo(),
-                    ref: branch,
-                    force: !!remote,
-                    remote,
-                })
-            )
-        );
+        try {
+            return await this.withGitOperation(GitOperation.checkout, () =>
+                this.wrapFS(
+                    git.checkout({
+                        ...this.getRepo(),
+                        ref: branch,
+                        force: !!remote,
+                        remote,
+                    })
+                )
+            );
+        } finally {
+            this.invalidateInfo();
+        }
     }
 
     async createBranch(branch: string): Promise<void> {
-        await this.wrapFS(
-            git.branch({ ...this.getRepo(), ref: branch, checkout: true })
-        );
+        try {
+            await this.wrapFS(
+                git.branch({ ...this.getRepo(), ref: branch, checkout: true })
+            );
+        } finally {
+            this.invalidateInfo();
+        }
     }
 
     async deleteBranch(branch: string): Promise<void> {
-        await this.wrapFS(git.deleteBranch({ ...this.getRepo(), ref: branch }));
+        try {
+            await this.wrapFS(
+                git.deleteBranch({ ...this.getRepo(), ref: branch })
+            );
+        } finally {
+            this.invalidateInfo();
+        }
     }
 
     branchIsMerged(_: string): Promise<boolean> {
@@ -1240,29 +1315,37 @@ export class IsomorphicGit extends GitManager {
     }
 
     async init(): Promise<void> {
-        await this.wrapFS(git.init(this.getRepo()));
+        try {
+            await this.wrapFS(git.init(this.getRepo()));
+        } finally {
+            this.invalidateInfo();
+        }
     }
 
     async clone(url: string, dir: string, depth?: number): Promise<void> {
-        const progressNotice = this.showNotice("Initializing clone");
         try {
-            await this.wrapFS(
-                git.clone({
-                    ...this.getRepo(),
-                    dir: dir,
-                    url: url,
-                    depth: depth,
-                    onProgress: (progress) => {
-                        if (progressNotice !== undefined) {
-                            progressNotice.setMessage(
-                                this.getProgressText("Cloning", progress)
-                            );
-                        }
-                    },
-                })
-            );
+            const progressNotice = this.showNotice("Initializing clone");
+            try {
+                await this.wrapFS(
+                    git.clone({
+                        ...this.getRepo(),
+                        dir: dir,
+                        url: url,
+                        depth: depth,
+                        onProgress: (progress) => {
+                            if (progressNotice !== undefined) {
+                                progressNotice.setMessage(
+                                    this.getProgressText("Cloning", progress)
+                                );
+                            }
+                        },
+                    })
+                );
+            } finally {
+                progressNotice?.hide();
+            }
         } finally {
-            progressNotice?.hide();
+            this.invalidateInfo();
         }
     }
 
@@ -1270,16 +1353,31 @@ export class IsomorphicGit extends GitManager {
         path: string,
         value: string | number | boolean | undefined
     ): Promise<void> {
-        return this.wrapFS(
-            git.setConfig({
-                ...this.getRepo(),
-                path: path,
-                value: value,
-            })
-        );
+        try {
+            return await this.wrapFS(
+                git.setConfig({
+                    ...this.getRepo(),
+                    path: path,
+                    value: value,
+                })
+            );
+        } finally {
+            this.invalidateInfo();
+        }
     }
 
     async getConfig(path: string): Promise<string | undefined> {
+        const cache = this.getInfoCache();
+        let value = cache.config.get(path);
+        if (!value) {
+            value = this.readConfig(path);
+            cache.config.set(path, value);
+            value.catch(() => cache.config.delete(path));
+        }
+        return value;
+    }
+
+    private readConfig(path: string): Promise<string | undefined> {
         return this.wrapFS(
             git.getConfig({
                 ...this.getRepo(),
@@ -1313,14 +1411,18 @@ export class IsomorphicGit extends GitManager {
     }
 
     async setRemote(name: string, url: string): Promise<void> {
-        await this.wrapFS(
-            git.addRemote({
-                ...this.getRepo(),
-                remote: name,
-                url: url,
-                force: true,
-            })
-        );
+        try {
+            await this.wrapFS(
+                git.addRemote({
+                    ...this.getRepo(),
+                    remote: name,
+                    url: url,
+                    force: true,
+                })
+            );
+        } finally {
+            this.invalidateInfo();
+        }
     }
 
     async getRemoteBranches(remote: string): Promise<string[]> {
@@ -1345,9 +1447,13 @@ export class IsomorphicGit extends GitManager {
     }
 
     async removeRemote(remoteName: string): Promise<void> {
-        await this.wrapFS(
-            git.deleteRemote({ ...this.getRepo(), remote: remoteName })
-        );
+        try {
+            await this.wrapFS(
+                git.deleteRemote({ ...this.getRepo(), remote: remoteName })
+            );
+        } finally {
+            this.invalidateInfo();
+        }
     }
 
     async getRemoteUrl(remote: string): Promise<string | undefined> {
@@ -1501,21 +1607,25 @@ export class IsomorphicGit extends GitManager {
     }
 
     async updateUpstreamBranch(remoteBranch: string): Promise<void> {
-        const [remote, branch] = splitRemoteBranch(remoteBranch);
-        const branchInfo = await this.branchInfo();
+        try {
+            const [remote, branch] = splitRemoteBranch(remoteBranch);
+            const branchInfo = await this.branchInfo();
 
-        await this.wrapFS(
-            git.push({
-                ...this.getRepo(),
-                remote: remote,
-                remoteRef: branch,
-            })
-        );
+            await this.wrapFS(
+                git.push({
+                    ...this.getRepo(),
+                    remote: remote,
+                    remoteRef: branch,
+                })
+            );
 
-        await this.setConfig(
-            `branch.${branchInfo.current}.merge`,
-            `refs/heads/${branch}`
-        );
+            await this.setConfig(
+                `branch.${branchInfo.current}.merge`,
+                `refs/heads/${branch}`
+            );
+        } finally {
+            this.invalidateInfo();
+        }
     }
 
     updateGitPath(_: string): Promise<void> {
@@ -1544,12 +1654,67 @@ export class IsomorphicGit extends GitManager {
         commitHash1: string,
         commitHash2: string
     ): Promise<WalkDifference[]> {
-        return this.walkDifference({
-            walkers: [
-                git.TREE({ ref: commitHash1 }),
-                git.TREE({ ref: commitHash2 }),
-            ],
-        });
+        const [tree1, tree2] = await Promise.all(
+            [commitHash1, commitHash2].map((ref) => this.getCommitTree(ref))
+        );
+        const changes: WalkDifference[] = [];
+        await this.diffTrees(tree1, tree2, "", changes);
+        return changes.sort((a, b) => (a.path < b.path ? -1 : 1));
+    }
+
+    private async getCommitTree(ref: string): Promise<string> {
+        const oid = await this.resolveRef(ref);
+        return (await git.readCommit({ ...this.getRepo(), oid })).commit.tree;
+    }
+
+    private async readTreeEntries(oid: string): Promise<TreeEntry[]> {
+        return (await git.readTree({ ...this.getRepo(), oid })).tree;
+    }
+
+    /** File changes between two trees, reading only subtrees whose oids differ. */
+    private async diffTrees(
+        oldTree: string | undefined,
+        newTree: string | undefined,
+        prefix: string,
+        changes: WalkDifference[]
+    ): Promise<void> {
+        if (oldTree === newTree) return;
+        const [oldEntries, newEntries] = await Promise.all([
+            oldTree ? this.readTreeEntries(oldTree) : [],
+            newTree ? this.readTreeEntries(newTree) : [],
+        ]);
+        const oldByName = new Map(oldEntries.map((e) => [e.path, e]));
+        const newByName = new Map(newEntries.map((e) => [e.path, e]));
+        const names = new Set([...oldByName.keys(), ...newByName.keys()]);
+        const subtrees: Promise<void>[] = [];
+        for (const name of [...names].sort()) {
+            const before = oldByName.get(name);
+            const after = newByName.get(name);
+            if (before?.oid === after?.oid && before?.type === after?.type) {
+                continue;
+            }
+            const path = prefix + name;
+            const oldSub = before?.type === "tree" ? before.oid : undefined;
+            const newSub = after?.type === "tree" ? after.oid : undefined;
+            if (oldSub || newSub) {
+                subtrees.push(
+                    this.diffTrees(oldSub, newSub, `${path}/`, changes)
+                );
+            }
+            const oldBlob = before?.type === "blob" ? before.oid : undefined;
+            const newBlob = after?.type === "blob" ? after.oid : undefined;
+            if (oldBlob === newBlob) continue;
+            changes.push({
+                path,
+                type:
+                    oldBlob === undefined
+                        ? "A"
+                        : newBlob === undefined
+                          ? "D"
+                          : "M",
+            });
+        }
+        await Promise.all(subtrees);
     }
 
     async walkDifference({
@@ -1624,26 +1789,54 @@ export class IsomorphicGit extends GitManager {
     protected override async getStagedForMessage(): Promise<
         Pick<Status, "staged" | "stagedOutsideVault">
     > {
-        try {
-            await this.resolveRef("HEAD");
-        } catch (error) {
-            // Without HEAD (first commit) there is no tree to compare with.
-            if (error instanceof Errors.NotFoundError) {
-                return super.getStagedForMessage();
-            }
-            throw error;
-        }
-        // Compare HEAD with the index only, skipping the full working tree walk.
-        const staged = await this.getStagedFiles();
+        const staged = await this.getIndexChanges();
         return {
-            staged: staged.map(({ path, vaultPath, type }) => ({
+            staged: staged.map(({ path, type }) => ({
                 path,
-                vaultPath,
+                vaultPath: this.getRelativeVaultPath(path),
                 index: type,
                 workingDir: " ",
             })),
             stagedOutsideVault: 0,
         };
+    }
+
+    /** Index entries by path (gitlinks excluded), read once. */
+    private async readIndexEntries(): Promise<Map<string, string>> {
+        const result = GitIndexManager.acquire(
+            {
+                fs: new FileSystem(this.fs),
+                gitdir: this.getGitDirPath(),
+                cache: {},
+            },
+            (rawIndex: unknown) => {
+                const entries = new Map<string, string>();
+                for (const [path, entry] of (rawIndex as GitIndexLike)
+                    .entriesMap) {
+                    if (entry.mode !== 0o160000) entries.set(path, entry.oid);
+                }
+                return entries;
+            }
+        ) as Promise<Map<string, string>>;
+        return this.wrapFS(result);
+    }
+
+    /** Differences between HEAD and the index, from the cached HEAD tree. */
+    private async getIndexChanges(): Promise<WalkDifference[]> {
+        const [head, index] = await Promise.all([
+            this.getHeadTree(),
+            this.readIndexEntries(),
+        ]);
+        const changes: WalkDifference[] = [];
+        for (const [path, oid] of index) {
+            const headOid = head.get(path);
+            if (headOid === undefined) changes.push({ path, type: "A" });
+            else if (headOid !== oid) changes.push({ path, type: "M" });
+        }
+        for (const path of head.keys()) {
+            if (!index.has(path)) changes.push({ path, type: "D" });
+        }
+        return changes.sort((a, b) => (a.path < b.path ? -1 : 1));
     }
 
     async getStagedFiles(

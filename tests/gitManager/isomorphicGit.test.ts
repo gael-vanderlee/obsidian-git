@@ -228,3 +228,23 @@ describe("IsomorphicGit.status", () => {
         expect(workTreeReads()).toBe(0);
     });
 });
+
+describe("IsomorphicGit info cache", () => {
+    it("returns fresh values right after changes", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const { manager } = createIsomorphicGitManager(repo.repoPath);
+        expect((await manager.branchInfo()).current).toBe("main");
+        expect(await manager.getConfig("user.name")).toBe("Test User");
+
+        await manager.setConfig("user.name", "Changed");
+        expect(await manager.getConfig("user.name")).toBe("Changed");
+
+        await manager.createBranch("feature");
+        const info = await manager.branchInfo();
+        expect(info.current).toBe("feature");
+        expect(info.branches.some((b) => b.endsWith("feature"))).toBe(true);
+
+        await manager.checkout("main");
+        expect((await manager.branchInfo()).current).toBe("main");
+    });
+});

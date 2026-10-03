@@ -1,5 +1,6 @@
 import { mkdirSync, rmSync, writeFileSync } from "fs";
 import path from "path";
+import git from "isomorphic-git";
 import { describe, expect, it, vi } from "vitest";
 import { withCleanup } from "../helpers/cleanup";
 import {
@@ -238,5 +239,63 @@ describe("IsomorphicGit commit diff", () => {
                 .sort();
             expect(actual, `${from}..${to}`).toEqual(expected);
         }
+    }, 60_000);
+});
+
+describe("IsomorphicGit incremental commit tree", () => {
+    it("builds the same tree as git write-tree across random commits", async () => {
+        const repo = withCleanup(await createRepoWithOrigin());
+        const { manager, plugin } = createIsomorphicGitManager(repo.repoPath);
+        plugin.localStorage = {
+            getHostname: () => null,
+        } as unknown as typeof plugin.localStorage;
+        plugin.settings.commitDateFormat = "YYYY";
+        const commitSpy = vi.spyOn(git, "commit");
+        const rand = random(11);
+        const pick = <T>(items: T[]) =>
+            items[Math.floor(rand() * items.length)]!;
+        const files = [
+            "a.md",
+            "d/b.md",
+            "d/e/c.md",
+            "d/e/f/g.md",
+            "x/y/z.md",
+            ".obsidian/p/main.js",
+            "run.sh",
+        ];
+        for (let i = 0; i < 30; i++) {
+            for (let n = 0; n < 1 + Math.floor(rand() * 3); n++) {
+                const file = pick(files);
+                const action = rand();
+                if (action < 0.25) {
+                    rmSync(path.join(repo.repoPath, file), { force: true });
+                } else if (action < 0.35 && path.dirname(file) !== ".") {
+                    rmSync(path.join(repo.repoPath, path.dirname(file)), {
+                        recursive: true,
+                        force: true,
+                    });
+                } else {
+                    write(repo, file, `${i} ${n}\n`);
+                }
+            }
+            if (rand() < 0.3) {
+                write(repo, "run.sh", `#!/bin/sh\necho ${i}\n`);
+                await repo
+                    .raw(["update-index", "--add", "--chmod=+x", "run.sh"])
+                    .catch(() => {});
+            }
+            await repo.git.add(["-A"]);
+            const expectedTree = await repo.raw(["write-tree"]);
+
+            await manager.commit({ message: `commit ${i}` });
+
+            expect(
+                await repo.raw(["rev-parse", "HEAD^{tree}"]),
+                `commit ${i}`
+            ).toBe(expectedTree);
+        }
+        await repo.raw(["fsck", "--full", "--strict"]);
+        const withTree = commitSpy.mock.calls.filter(([args]) => args.tree);
+        expect(withTree.length).toBe(commitSpy.mock.calls.length);
     }, 60_000);
 });

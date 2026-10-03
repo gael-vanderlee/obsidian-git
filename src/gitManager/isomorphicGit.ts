@@ -71,7 +71,7 @@ export class IsomorphicGit extends GitManager {
     /** Use the index and Obsidian's file cache for status instead of a full walk. */
     useFastStatus = true;
     // Blob oids of the HEAD tree by path, cached per HEAD commit.
-    private headTree?: { commit: string; files: Map<string, string> };
+    private headTree?: HeadSnapshot;
     // isIgnored results, valid while the .gitignore files are unchanged.
     private ignoredCache?: { signature: string; results: Map<string, boolean> };
     // Branch info and config reads, reused for a few seconds; mutators clear it.
@@ -303,22 +303,48 @@ export class IsomorphicGit extends GitManager {
                 }
 
                 // The new tree is the index, so HEAD vs index is what gets committed.
-                const changes = amend
-                    ? undefined
-                    : await this.getIndexChanges();
-                const indexFiles = amend
-                    ? undefined
-                    : await this.readIndexEntries();
+                let changes: WalkDifference[] | undefined;
+                let built:
+                    { tree: string; dirs: Map<string, string> } | undefined;
+                let index: IndexSnapshot | undefined;
+                if (!amend) {
+                    const head = await this.getHeadSnapshot();
+                    index = await this.readIndexSnapshot();
+                    changes = await this.getIndexChanges(head, index);
+                    if (
+                        head.commit &&
+                        !index.hasGitlinks &&
+                        !index.hasConflicts
+                    ) {
+                        built = await this.writeIndexTree(head, index);
+                    }
+                }
                 const oid = await this.wrapFS(
                     git.commit({
                         ...this.getRepo(),
                         message: formatMessage,
                         amend,
                         parent: parent,
+                        tree: built?.tree,
                     })
                 );
-                if (indexFiles) {
-                    this.headTree = { commit: oid, files: indexFiles };
+                if (built && index) {
+                    this.headTree = {
+                        commit: oid,
+                        files: new Map(
+                            [...index.files].map(([path, entry]) => [
+                                path,
+                                entry.oid,
+                            ])
+                        ),
+                        modes: new Map(
+                            [...index.files].map(([path, entry]) => [
+                                path,
+                                entry.mode,
+                            ])
+                        ),
+                        dirs: built.dirs,
+                    };
                 }
                 const committedFiles =
                     changes?.length ?? (await this.getCommittedFilesCount(oid));
@@ -901,27 +927,135 @@ export class IsomorphicGit extends GitManager {
 
     /** Blob oids of the HEAD tree by repo path; empty before the first commit. */
     private async getHeadTree(): Promise<Map<string, string>> {
+        return (await this.getHeadSnapshot()).files;
+    }
+
+    /** HEAD's files, modes and directory tree oids, cached per HEAD commit. */
+    private async getHeadSnapshot(): Promise<HeadSnapshot> {
         let commit: string;
         try {
             commit = await this.resolveRef("HEAD");
         } catch (error) {
-            if (error instanceof Errors.NotFoundError) return new Map();
+            if (error instanceof Errors.NotFoundError) {
+                return {
+                    commit: "",
+                    files: new Map(),
+                    modes: new Map(),
+                    dirs: new Map(),
+                };
+            }
             throw error;
         }
-        if (this.headTree?.commit === commit) return this.headTree.files;
+        if (this.headTree?.commit === commit) return this.headTree;
         const files = new Map<string, string>();
+        const modes = new Map<string, number>();
+        const dirs = new Map<string, string>([
+            [
+                "",
+                (await git.readCommit({ ...this.getRepo(), oid: commit }))
+                    .commit.tree,
+            ],
+        ]);
         await git.walk({
             ...this.getRepo(),
             trees: [git.TREE({ ref: commit })],
             map: async (filepath, [entry]) => {
                 if (filepath === "." || !entry) return;
                 const type = await entry.type();
-                if (type === "blob") files.set(filepath, await entry.oid());
+                if (type === "blob") {
+                    files.set(filepath, await entry.oid());
+                    modes.set(filepath, await entry.mode());
+                } else if (type === "tree") {
+                    dirs.set(filepath, await entry.oid());
+                }
                 return type === "tree" ? undefined : null;
             },
         });
-        this.headTree = { commit, files };
-        return files;
+        this.headTree = { commit, files, modes, dirs };
+        return this.headTree;
+    }
+
+    /**
+     * Writes the index as a tree, rebuilding only directories that differ
+     * from HEAD and reusing HEAD's tree oids for the rest.
+     */
+    private async writeIndexTree(
+        head: HeadSnapshot,
+        index: IndexSnapshot
+    ): Promise<{ tree: string; dirs: Map<string, string> }> {
+        const parentOf = (path: string) => {
+            const slash = path.lastIndexOf("/");
+            return slash === -1 ? "" : path.slice(0, slash);
+        };
+        const nameOf = (path: string) => path.slice(path.lastIndexOf("/") + 1);
+        const dirty = new Set<string>();
+        const markDirty = (path: string) => {
+            let dir = parentOf(path);
+            while (!dirty.has(dir)) {
+                dirty.add(dir);
+                if (dir === "") break;
+                dir = parentOf(dir);
+            }
+        };
+        const files = new Map<string, TreeEntry[]>();
+        const subdirs = new Map<string, Set<string>>();
+        for (const [path, { oid, mode }] of index.files) {
+            const dir = parentOf(path);
+            if (!files.has(dir)) files.set(dir, []);
+            files.get(dir)!.push({
+                mode: mode.toString(8),
+                path: nameOf(path),
+                oid,
+                type: "blob",
+            });
+            for (let child = dir; child !== ""; child = parentOf(child)) {
+                const parent = parentOf(child);
+                if (!subdirs.has(parent)) subdirs.set(parent, new Set());
+                subdirs.get(parent)!.add(child);
+            }
+            if (head.files.get(path) !== oid || head.modes.get(path) !== mode) {
+                markDirty(path);
+            }
+        }
+        for (const path of head.files.keys()) {
+            if (!index.files.has(path)) markDirty(path);
+        }
+        const dirs = new Map(head.dirs);
+        const build = async (dir: string): Promise<string> => {
+            if (!dirty.has(dir)) {
+                const cached = head.dirs.get(dir);
+                if (cached === undefined) {
+                    throw new Error(`Missing cached tree for "${dir}"`);
+                }
+                return cached;
+            }
+            const entries = [...(files.get(dir) ?? [])];
+            for (const child of subdirs.get(dir) ?? []) {
+                entries.push({
+                    mode: "040000",
+                    path: nameOf(child),
+                    oid: await build(child),
+                    type: "tree",
+                });
+            }
+            const oid = await git.writeTree({
+                ...this.getRepo(),
+                tree: entries,
+            });
+            dirs.set(dir, oid);
+            return oid;
+        };
+        const tree = await build("");
+        for (const dir of [...dirs.keys()]) {
+            if (
+                dir !== "" &&
+                dirty.has(parentOf(dir)) &&
+                !subdirs.get(parentOf(dir))?.has(dir)
+            ) {
+                dirs.delete(dir);
+            }
+        }
+        return { tree, dirs };
     }
 
     private async hashWorkingFile(filepath: string): Promise<string> {
@@ -1801,8 +1935,8 @@ export class IsomorphicGit extends GitManager {
         };
     }
 
-    /** Index entries by path (gitlinks excluded), read once. */
-    private async readIndexEntries(): Promise<Map<string, string>> {
+    /** Stage-0 index entries by path; gitlinks and conflicts are only flagged. */
+    private async readIndexSnapshot(): Promise<IndexSnapshot> {
         const result = GitIndexManager.acquire(
             {
                 fs: new FileSystem(this.fs),
@@ -1810,31 +1944,43 @@ export class IsomorphicGit extends GitManager {
                 cache: {},
             },
             (rawIndex: unknown) => {
-                const entries = new Map<string, string>();
-                for (const [path, entry] of (rawIndex as GitIndexLike)
-                    .entriesMap) {
-                    if (entry.mode !== 0o160000) entries.set(path, entry.oid);
+                const index = rawIndex as GitIndexLike;
+                const snapshot: IndexSnapshot = {
+                    files: new Map(),
+                    hasGitlinks: false,
+                    hasConflicts: index.unmergedPaths.length > 0,
+                };
+                for (const [path, entry] of index.entriesMap) {
+                    if (entry.mode === 0o160000) snapshot.hasGitlinks = true;
+                    else
+                        snapshot.files.set(path, {
+                            oid: entry.oid,
+                            mode: entry.mode,
+                        });
                 }
-                return entries;
+                return snapshot;
             }
-        ) as Promise<Map<string, string>>;
+        ) as Promise<IndexSnapshot>;
         return this.wrapFS(result);
     }
 
     /** Differences between HEAD and the index, from the cached HEAD tree. */
-    private async getIndexChanges(): Promise<WalkDifference[]> {
-        const [head, index] = await Promise.all([
-            this.getHeadTree(),
-            this.readIndexEntries(),
+    private async getIndexChanges(
+        head?: HeadSnapshot,
+        index?: IndexSnapshot
+    ): Promise<WalkDifference[]> {
+        [head, index] = await Promise.all([
+            head ?? this.getHeadSnapshot(),
+            index ?? this.readIndexSnapshot(),
         ]);
         const changes: WalkDifference[] = [];
-        for (const [path, oid] of index) {
-            const headOid = head.get(path);
+        for (const [path, { oid }] of index.files) {
+            const headOid = head.files.get(path);
             if (headOid === undefined) changes.push({ path, type: "A" });
             else if (headOid !== oid) changes.push({ path, type: "M" });
         }
-        for (const path of head.keys()) {
-            if (!index.has(path)) changes.push({ path, type: "D" });
+        for (const path of head.files.keys()) {
+            if (!index.files.has(path)) changes.push({ path, type: "D" });
         }
         return changes.sort((a, b) => (a.path < b.path ? -1 : 1));
     }
@@ -2196,6 +2342,19 @@ async function inflateIfGzipped(buffer: ArrayBuffer): Promise<ArrayBuffer> {
 }
 
 type WorkingFileStats = { ctimeMs: number; mtimeMs: number; size: number };
+
+type HeadSnapshot = {
+    commit: string;
+    files: Map<string, string>;
+    modes: Map<string, number>;
+    dirs: Map<string, string>;
+};
+
+type IndexSnapshot = {
+    files: Map<string, { oid: string; mode: number }>;
+    hasGitlinks: boolean;
+    hasConflicts: boolean;
+};
 
 // The parts of isomorphic-git's untyped GitIndex used by the fast status.
 type GitIndexLike = {
